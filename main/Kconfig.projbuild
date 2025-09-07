@@ -1,0 +1,27 @@
+menu "EcoWatt Settings"
+
+config ECOWATT_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "Galaxy Tab S7 FE 7C28"
+    help
+        Your access point SSID.
+
+config ECOWATT_WIFI_PASS
+    string "Wi-Fi Password"
+    default ""
+    help
+        Your access point password.
+
+config ECOWATT_API_BASE_URL
+    string "API Base URL"
+    default "http://20.15.114.131:8080"
+    help
+        Base URL for the University API (without trailing slash).
+
+config ECOWATT_API_KEY_B64
+    string "API Key (Base64 'user:pass')"
+    default "NjhhZWIwNDU1ZDdmMzg3MzNiMTQ5YTFlOjY4YWViMDQ1NWQ3ZjM4NzMzYjE0OWExNA=="
+    help
+        Paste the provided Base64 API key here exactly, with no 'Basic ' prefix.
+
+endmenu
