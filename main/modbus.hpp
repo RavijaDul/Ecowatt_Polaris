@@ -1,74 +1,49 @@
-// main/modbus.hpp
-#pragma once
-// Ensures this header is included only once during translation.
+#pragma once                                        // L1: Prevent multiple inclusion of this header.
 
-#include <cstdint>  // Fixed-width integer types (e.g., uint8_t, uint16_t)
-#include <string>   // std::string for hex strings
-#include <vector>   // std::vector for dynamic byte/register buffers
+#include <cstdint>                                  // L3: Fixed-width integer types.
+#include <string>                                   // L4: std::string for hex frames.
+#include <vector>                                   // L5: std::vector for register lists.
 
-namespace modbus {
+namespace modbus {                                  // L7: Begin modbus namespace.
 
-// ============================== Utilities ===============================
+// ------------------------ CRC ------------------------
 
-// crc16
-// Computes Modbus RTU CRC-16 over a byte buffer.
-// Algorithm: reflected CRC-16 with polynomial 0xA001, initial value 0xFFFF.
-// Return value is the raw CRC; when serialized into frames, CRC is little-endian
-// (low byte first, then high byte).
-uint16_t crc16(const uint8_t* data, size_t len);
+// Compute Modbus RTU CRC16 (poly 0xA001, init 0xFFFF) over a byte buffer.
+uint16_t crc16(const uint8_t* data, size_t len);    // L12
 
-// hex_to_bytes
-// Converts an ASCII hex string into raw bytes.
-// Accepts uppercase/lowercase hex; whitespace is ignored.
-// Non-hex characters are ignored defensively; an odd trailing nibble is dropped.
-std::vector<uint8_t> hex_to_bytes(const std::string& hex);
+// -------------------- Hex helpers --------------------
 
-// bytes_to_hex
-// Converts a raw byte buffer to an uppercase ASCII hex string with no separators.
-std::string bytes_to_hex(const uint8_t* data, size_t len);
+// Convert ASCII hex (whitespace tolerated) into bytes; ignores non-hex characters.
+std::vector<uint8_t> hex_to_bytes(const std::string& hex); // L16
 
-// ============================ Frame builders ============================
+// Convert bytes → uppercase ASCII hex without separators.
+std::string bytes_to_hex(const uint8_t* data, size_t len); // L18
 
-// make_read_holding
-// Builds a Modbus RTU "Read Holding Registers" (function 0x03) request.
-// Layout (before hex encoding):
-//   [slave][0x03][start_hi][start_lo][count_hi][count_lo][CRC_lo][CRC_hi]
-std::string make_read_holding(uint8_t slave, uint16_t start_addr, uint16_t count);
+// -------------------- Builders -----------------------
 
-// make_write_single
-// Builds a Modbus RTU "Write Single Register" (function 0x06) request.
-// Layout (before hex encoding):
-//   [slave][0x06][reg_hi][reg_lo][val_hi][val_lo][CRC_lo][CRC_hi]
-std::string make_write_single(uint8_t slave, uint16_t reg_addr, uint16_t value);
+// Build a Modbus 0x03 (Read Holding Registers) request frame and return as ASCII hex.
+std::string make_read_holding(uint8_t slave, uint16_t start_addr, uint16_t count); // L22
 
-// ============================== Parsers =================================
+// Build a Modbus 0x06 (Write Single Register) request frame and return as ASCII hex.
+std::string make_write_single(uint8_t slave, uint16_t reg_addr, uint16_t value);   // L24
 
-// parse_read_response
-// Parses a normal Modbus RTU response to function 0x03.
-// Expected layout (after hex→bytes):
-//   [slave][0x03][byte_count][data...][CRC_lo][CRC_hi]
-// - 'data' is big-endian 16-bit registers (hi,lo per register).
-// On success: returns true, sets out_slave, out_func, and fills out_regs.
-// On failure: returns false (CRC mismatch, function not 0x03, malformed size, or exception frame).
+// --------------------- Parsers -----------------------
+
+// Parse a normal 0x03 response from ASCII hex.
+// On success, fills out_slave, out_func (=0x03), and out_regs (big-endian words).
 bool parse_read_response(const std::string& resp_hex,
                          uint8_t& out_slave,
                          uint8_t& out_func,
-                         std::vector<uint16_t>& out_regs);
+                         std::vector<uint16_t>& out_regs);                           // L31–L34
 
-// parse_exception_response
-// Parses a Modbus RTU exception response.
-// Expected layout:
-//   [slave][(func|0x80)][exception_code][CRC_lo][CRC_hi]
-// On success: returns true and sets out_slave, out_func (with MSB set), and out_exc_code.
-// On failure: returns false (CRC mismatch, not an exception frame, or malformed).
+// Parse an exception frame from ASCII hex.
+// On success, fills out_slave, out_func (=original|0x80), and out_exc_code.
 bool parse_exception_response(const std::string& resp_hex,
                               uint8_t& out_slave,
                               uint8_t& out_func,
-                              uint8_t& out_exc_code);
+                              uint8_t& out_exc_code);                                // L39–L42
 
-// exception_name
-// Maps a Modbus exception code (e.g., 0x02) to a short human-readable description.
-// Returns "Unknown Modbus exception" for unmapped codes.
-const char* exception_name(uint8_t code);
+// Return a human-readable name for common Modbus exception codes.
+const char* exception_name(uint8_t c);                                               // L44
 
-} // namespace modbus
+} // namespace modbus                            // L46

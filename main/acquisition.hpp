@@ -1,69 +1,50 @@
-#pragma once
-// Ensures this header is included only once during compilation.
+#pragma once                                      // L1: Ensure this header is included only once per TU.
 
-#include <string>   // std::string for server URL and API key
-#include <vector>   // std::vector for temporary register buffers
-#include <cstdint>  // fixed-width integer types (e.g., uint16_t)
+#include <cstdint>                                // L3: Fixed-width integer types (uint16_t, etc.).
+#include <string>                                 // L4: std::string for URLs and keys.
+#include <vector>                                 // L5: std::vector for register lists.
 
-namespace acquisition {  // Public API for the acquisition layer
+namespace acquisition {                           // L7: All acquisition types live under this namespace.
 
-// Sample
-// Holds the raw register values read from the inverter simulator.
-// Notes:
-//  - Addresses (addr) correspond to Modbus holding registers.
-//  - "gain" indicates the scale factor to obtain engineering units
-//    (e.g., value/gain for Vac1 → volts).
-//  - All fields are raw 16-bit unsigned words.
-struct Sample {
-    uint16_t vac1;           // addr 0, gain 10   → AC voltage (Vac1): value/10 V
-    uint16_t iac1;           // addr 1, gain 10   → AC current (Iac1): value/10 A
-    uint16_t fac1;           // addr 2, gain 100  → AC frequency (Fac1): value/100 Hz
-    uint16_t vpv1;           // addr 3, gain 10   → PV1 voltage (Vpv1): value/10 V
-    uint16_t vpv2;           // addr 4, gain 10   → PV2 voltage (Vpv2): value/10 V
-    uint16_t ipv1;           // addr 5, gain 10   → PV1 current (Ipv1): value/10 A
-    uint16_t ipv2;           // addr 6, gain 10   → PV2 current (Ipv2): value/10 A
-    uint16_t temp;           // addr 7, gain 10   → Internal temperature: value/10 °C
-    uint16_t export_percent; // addr 8, gain 1    → Export power limit (%), read/write
-    uint16_t pac;            // addr 9, gain 1    → Active power (Pac) in watts
+// ---- Basic sample captured from inverter registers (10 fields total) ----
+struct Sample {                                   // L10: POD struct mirroring the register map.
+    uint16_t vac1;                                // L11: AC voltage (x0.1 V).
+    uint16_t iac1;                                // L12: AC current (x0.1 A).
+    uint16_t fac1;                                // L13: AC frequency (x0.01 Hz).
+    uint16_t vpv1;                                // L14: PV1 voltage (x0.1 V).
+    uint16_t vpv2;                                // L15: PV2 voltage (x0.1 V).
+    uint16_t ipv1;                                // L16: PV1 current (x0.1 A).
+    uint16_t ipv2;                                // L17: PV2 current (x0.1 A).
+    uint16_t temp;                                // L18: Inverter temperature (x0.1 °C).
+    uint16_t export_percent;                      // L19: Export power limit (%).
+    uint16_t pac;                                 // L20: Active power (W).
 };
 
-// Acquisition
-// High-level façade for reading/writing Modbus registers via the HTTP API.
-// Responsibilities:
-//  - Read grouped registers and populate a Sample.
-//  - Write the export power limit (register 8) with bounds checking.
-//  - Hide transport details (URL, auth) and Modbus frame handling.
-class Acquisition {
+// ---- Driver that talks to the Inverter SIM via HTTP (Modbus frames in JSON) ----
+class Acquisition {                               // L24: High-level façade used by main.cpp.
 public:
-    // Constructor
-    // Stores the base server URL (e.g., "http://<ip>:8080") and the Base64
-    // authorization string ("user:pass" encoded) for subsequent requests.
-    Acquisition(const std::string& base_url, const std::string& api_key_b64);
+    // Construct with base server URL and Authorization header token (Base64 if Basic).
+    Acquisition(const std::string& base_url,      // L27
+                const std::string& api_key_b64);  // L28
 
-    // set_export_power
-    // Writes the export power limit (0..100) to register 8 using a Modbus
-    // Write Single Register (function 0x06). Values are clamped to [0,100].
-    // Returns true on a successful echo reply; false on exception/malformed/transport error.
-    bool set_export_power(int percent, const std::string& reason_tag);
+    // Read a contiguous group of holding registers (function 0x03).
+    // Returns true on success and fills 'out_regs' with 'count' words.
+    bool read_group(uint16_t addr,                // L32
+                    uint16_t count,               // L33
+                    std::vector<uint16_t>& out_regs); // L34
 
-    // read_all
-    // Performs a small number of grouped Modbus reads to fill the provided Sample.
-    // Returns true if at least one group read succeeded; false if all groups failed.
-    // Scaling to engineering units is not applied here (raw values only).
-    bool read_all(Sample& out);
+    // Write export power percentage (0..100) into register 8 (function 0x06).
+    // Returns true when the simulator echoes the exact write frame.
+    bool set_export_power(int percent,            // L38
+                          const std::string& reason_tag); // L39
+
+    // Convenience: read all 10 registers into a Sample.
+    // Tries one big read; falls back to smaller groups if needed.
+    bool read_all(Sample& out);                   // L43
 
 private:
-    // Base server URL (no trailing slash), e.g., "http://20.15.114.131:8080"
-    std::string base_url_;
-
-    // Authorization header value (already Base64-encoded "user:pass")
-    std::string api_key_;
-
-    // read_group
-    // Helper to read 'count' contiguous holding registers starting at 'addr'.
-    // On success, fills 'out_regs' with raw 16-bit words (host endian) and returns true.
-    // Returns false on Modbus exception, CRC/malformed frame, or transport error.
-    bool read_group(uint16_t addr, uint16_t count, std::vector<uint16_t>& out_regs);
+    std::string base_url_;                        // L46: e.g., "http://20.15.114.131:8080".
+    std::string api_key_;                         // L47: Authorization header value (may be empty).
 };
 
-} // namespace acquisition
+} // namespace acquisition                         // L50: Close namespace.

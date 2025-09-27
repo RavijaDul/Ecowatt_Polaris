@@ -1,1 +1,56 @@
-/build
+
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pdb
+*.egg
+*.egg-info/
+*.manifest
+*.spec
+
+# --- Virtual Environments ---
+venv/
+env/
+ENV/
+.venv/
+EcoWatt-LocalAPI/venv/
+
+# --- Build / Packaging ---
+build/
+dist/
+wheels/
+.eggs/
+
+# --- Logs / Databases / Coverage ---
+*.log
+*.pot
+*.sqlite3
+*.db
+*.sql
+*.bak
+*.mo
+coverage/
+*.coverage
+htmlcov/
+
+# --- IDE / Editor settings ---
+.vscode/
+.idea/
+*.swp
+*.swo
+*.sublime-workspace
+*.sublime-project
+
+# --- OS files ---
+.DS_Store
+Thumbs.db
+
+# --- Environment variables / secrets ---
+.env
+.env.*
+*.pem
+*.key
+
