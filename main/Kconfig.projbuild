@@ -1,27 +1,41 @@
 menu "EcoWatt Settings"
 
-config ECOWATT_WIFI_SSID
-    string "Wi-Fi SSID"
-    default "Galaxy Tab S7 FE 7C28"
-    help
-        Your access point SSID.
+    config ECOWATT_WIFI_SSID
+        string "Wi-Fi SSID"
+        default "YOUR_WIFI_SSID"
 
-config ECOWATT_WIFI_PASS
-    string "Wi-Fi Password"
-    default ""
-    help
-        Your access point password.
+    config ECOWATT_WIFI_PASS
+        string "Wi-Fi Password"
+        default "YOUR_WIFI_PASSWORD"
 
-config ECOWATT_API_BASE_URL
-    string "API Base URL"
-    default "http://20.15.114.131:8080"
-    help
-        Base URL for the University API (without trailing slash).
+    config ECOWATT_API_BASE_URL
+        string "Inverter SIM Base URL"
+        default "http://20.15.114.131:8080"
 
-config ECOWATT_API_KEY_B64
-    string "API Key (Base64 'user:pass')"
-    default "NjhhZWIwNDU1ZDdmMzg3MzNiMTQ5YTFlOjY4YWViMDQ1NWQ3ZjM4NzMzYjE0OWExNA=="
-    help
-        Paste the provided Base64 API key here exactly, with no 'Basic ' prefix.
+    config ECOWATT_API_KEY_B64
+        string "Inverter SIM API key (Base64 user:pass)"
+        default ""
+
+    config ECOWATT_CLOUD_BASE_URL
+        string "EcoWatt Cloud Base URL (HTTP/HTTPS)"
+        default "http://192.168.65.146:5000"
+
+    config ECOWATT_CLOUD_KEY_B64
+        string "EcoWatt Cloud API key (Base64 user:pass)"
+        default ""
+
+    config ECOWATT_UPLOAD_INTERVAL_SEC
+        int "Upload interval seconds (15 demo / 900 real)"
+        range 5 3600
+        default 15
+
+    config ECOWATT_SAMPLE_PERIOD_MS
+        int "Sampling period (ms)"
+        range 100 60000
+        default 5000
+
+    config ECOWATT_DEVICE_ID
+        string "Device ID"
+        default "EcoWatt-Dev-01"
 
 endmenu
