@@ -1,224 +1,461 @@
 // ===== must be first so Kconfig macros are visible =====
-#include "sdkconfig.h" // L1: include the auto-generated configuration header from ESP-IDF build
+#include "sdkconfig.h"
+#include <esp_ota_ops.h>
 
-// Back-compat guards (silence IntelliSense/old IDF diffs)
-#ifndef CONFIG_LOG_MAXIMUM_LEVEL
-#define CONFIG_LOG_MAXIMUM_LEVEL CONFIG_LOG_DEFAULT_LEVEL // L6–L7: ensure logging macros exist
-#endif
-#ifndef CONFIG_FREERTOS_HZ
-#define CONFIG_FREERTOS_HZ configTICK_RATE_HZ // L10–L11: fallback for tick frequency
-#endif
-#ifndef CONFIG_ECOWATT_NTP_SERVER
-#define CONFIG_ECOWATT_NTP_SERVER "pool.ntp.org" // L14–L15: default NTP server
-#endif
-// =======================================================
-
-#include <cstring>    // L19: for strncpy
-#include <string>     // L20: C++ std::string
-#include <sys/time.h> // L21: for gettimeofday
-
-#include "esp_wifi.h"   // L23: Wi-Fi functions
-#include "esp_event.h"  // L24: event loop
-#include "esp_log.h"    // L25: logging macros
-#include "nvs_flash.h"  // L26: nonvolatile storage
-#include "esp_netif.h"  // L27: network interface
-#include "esp_timer.h"  // L28: monotonic timer
-#include "esp_sntp.h"   // L29: NTP client
-
-#include "freertos/FreeRTOS.h"  // L31: FreeRTOS core
-#include "freertos/task.h"      // L32: FreeRTOS tasks
-#include "freertos/event_groups.h" // L33: FreeRTOS event groups
-#include "freertos/semphr.h"       // L34: FreeRTOS semaphores
-
-#include "acquisition.hpp" // L36: acquisition class
-#include "buffer.hpp"      // L37: ring buffer
-#include "packetizer.hpp"  // L38: payload builder for uplink
-
-// ---- Kconfig fallbacks ----
 #ifndef CONFIG_ECOWATT_WIFI_SSID
-#define CONFIG_ECOWATT_WIFI_SSID "YOUR_WIFI_SSID" // L42–L43: default Wi-Fi SSID
+#define CONFIG_ECOWATT_WIFI_SSID "YOUR_WIFI_SSID"
 #endif
 #ifndef CONFIG_ECOWATT_WIFI_PASS
-#define CONFIG_ECOWATT_WIFI_PASS "YOUR_WIFI_PASSWORD" // L45–L46: default Wi-Fi password
+#define CONFIG_ECOWATT_WIFI_PASS "YOUR_WIFI_PASSWORD"
 #endif
 #ifndef CONFIG_ECOWATT_API_BASE_URL
-#define CONFIG_ECOWATT_API_BASE_URL "http://20.15.114.131:8080" // L48–L49: SIM base URL
+#define CONFIG_ECOWATT_API_BASE_URL "http://20.15.114.131:8080"
 #endif
 #ifndef CONFIG_ECOWATT_API_KEY_B64
-#define CONFIG_ECOWATT_API_KEY_B64 "" // L51–L52: API key for SIM
+#define CONFIG_ECOWATT_API_KEY_B64 ""
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_BASE_URL
-#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.1.100:5000" // L54–L55: Cloud server URL
+#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.246.159:5000"
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_KEY_B64
-#define CONFIG_ECOWATT_CLOUD_KEY_B64 "" // L57–L58: Cloud API key
+#define CONFIG_ECOWATT_CLOUD_KEY_B64 ""
 #endif
 #ifndef CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC
-#define CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC 15 // L60–L61: default upload window
+#define CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC 15
 #endif
 #ifndef CONFIG_ECOWATT_SAMPLE_PERIOD_MS
-#define CONFIG_ECOWATT_SAMPLE_PERIOD_MS 5000 // L63–L64: sample every 5 seconds
+#define CONFIG_ECOWATT_SAMPLE_PERIOD_MS 5000
 #endif
 #ifndef CONFIG_ECOWATT_DEVICE_ID
-#define CONFIG_ECOWATT_DEVICE_ID "EcoWatt-Dev-01" // L66–L67: device identifier
+#define CONFIG_ECOWATT_DEVICE_ID "EcoWatt-Dev-01"
 #endif
-// -----------------------------------------------------
+#ifndef CONFIG_ECOWATT_PSK
+#define CONFIG_ECOWATT_PSK "ecowatt-demo-psk"
+#endif
+#ifndef CONFIG_ECOWATT_USE_ENVELOPE
+#define CONFIG_ECOWATT_USE_ENVELOPE 1
+#endif
 
-static const char* TAG = "main"; // L70: log tag
-static EventGroupHandle_t s_evt; // L71: event group handle
-static constexpr int BIT_CONNECTED = BIT0; // L72: bitmask for Wi-Fi connected
-static constexpr int BIT_GOT_IP   = BIT1; // L73: bitmask for IP received
-static constexpr int BIT_NTP_OK   = BIT2; // L74: bitmask for NTP sync done
+#include <cstring>
+#include <string>
+#include <sys/time.h>
+#include <cinttypes>
+#include <inttypes.h>
 
-// Shared ring + mutex
-static buffer::Ring* g_ring = nullptr; // L77: pointer to shared ring buffer
-static SemaphoreHandle_t g_ring_mtx = nullptr; // L78: mutex to guard ring
+#include "esp_wifi.h"
+#include "esp_event.h"
+#include "esp_log.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_timer.h"
+#include "esp_sntp.h"
 
-// epoch offset (epoch_ms = monotonic_ms + offset_ms)
-static int64_t s_epoch_offset_ms = 0; // L81: offset between monotonic and epoch
-static inline uint64_t monotonic_ms(){ return (uint64_t)esp_timer_get_time() / 1000ULL; } // L82–L83: read monotonic ms
-static inline uint64_t now_ms_epoch(){ return (uint64_t)((int64_t)monotonic_ms() + s_epoch_offset_ms); } // L84–L85: convert to epoch ms
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/event_groups.h"
+#include "freertos/semphr.h"
 
-// Wi-Fi events
-static void on_wifi(void*, esp_event_base_t base, int32_t id, void*) { // L88–L89: Wi-Fi event handler
-    if (base != WIFI_EVENT) return; // L90: ignore non-WiFi events
-    switch (id) { // L91: handle Wi-Fi event ID
-        case WIFI_EVENT_STA_START:      esp_wifi_connect(); break; // L92: when started, connect
-        case WIFI_EVENT_STA_CONNECTED:  xEventGroupSetBits(s_evt, BIT_CONNECTED); ESP_LOGI(TAG, "Wi-Fi associated"); break; // L93: log association
-        case WIFI_EVENT_STA_DISCONNECTED:
-            xEventGroupClearBits(s_evt, BIT_CONNECTED | BIT_GOT_IP); // L95: clear status bits
-            ESP_LOGW(TAG, "Wi-Fi disconnected — reconnecting…"); // L96: warn
-            esp_wifi_connect(); // L97: reconnect
-            break;
-        default: break; // L98: ignore others
-    }
+#include "acquisition.hpp"
+#include "buffer.hpp"
+#include "packetizer.hpp"
+#include "codec.hpp"
+#include "security.hpp"
+#include "nvstore.hpp"
+#include "control.hpp"
+#include "fota.hpp"
+
+static const char* TAG = "main";
+
+static EventGroupHandle_t s_evt;
+static constexpr int BIT_CONNECTED = BIT0;
+static constexpr int BIT_GOT_IP    = BIT1;
+static constexpr int BIT_NTP_OK    = BIT2;
+
+static buffer::Ring* g_ring = nullptr;
+static SemaphoreHandle_t g_ring_mtx = nullptr;
+
+static int64_t s_epoch_offset_ms = 0;
+static inline uint64_t monotonic_ms(){ return (uint64_t)esp_timer_get_time() / 1000ULL; }
+static inline uint64_t now_ms_epoch(){ return (uint64_t)((int64_t)monotonic_ms() + s_epoch_offset_ms); }
+
+// Runtime config/command/FOTA
+static control::RuntimeConfig g_cfg_cur{}; 
+static control::RuntimeConfig g_cfg_next{};
+static bool g_has_pending_cfg = false;
+
+static control::PendingCommand g_cmd{};
+static control::CommandResult  g_cmd_res{};
+
+static uint64_t g_device_nonce = 0;
+static uint64_t g_last_cloud_nonce = 0;
+
+static acquisition::Acquisition* g_acq = nullptr;
+struct {
+  bool has = false;
+  uint32_t written = 0;
+  uint32_t total   = 0;
+} g_fota_progress;
+
+struct {
+  bool has = false;
+  bool verify_ok = false;
+  bool apply_ok  = false;
+} g_fota_report;
+
+struct {
+  bool has = false;   // set once on first successful boot after OTA
+} g_fota_bootack;
+
+// Called by fota.cpp after each accepted chunk
+extern "C" void fota_progress_notify(uint32_t written, uint32_t total){
+  g_fota_progress.has   = true;
+  g_fota_progress.written = written;
+  g_fota_progress.total   = total;
 }
-static void on_ip(void*, esp_event_base_t base, int32_t id, void* data) { // L101: IP event handler
-    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) { // L102: check IP event
-        auto* e = static_cast<ip_event_got_ip_t*>(data); // L103: cast event
-        ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip)); // L104: log IP
-        xEventGroupSetBits(s_evt, BIT_GOT_IP); // L105: set IP bit
-    }
+
+static void on_wifi(void*, esp_event_base_t base, int32_t id, void*) {
+  if (base != WIFI_EVENT) return;
+  switch (id) {
+    case WIFI_EVENT_STA_START:     esp_wifi_connect(); break;
+    case WIFI_EVENT_STA_CONNECTED: xEventGroupSetBits(s_evt, BIT_CONNECTED); ESP_LOGI(TAG, "Wi-Fi associated"); break;
+    case WIFI_EVENT_STA_DISCONNECTED:
+      xEventGroupClearBits(s_evt, BIT_CONNECTED | BIT_GOT_IP);
+      ESP_LOGW(TAG, "Wi-Fi disconnected — reconnecting…"); esp_wifi_connect(); break;
+    default: break;
+  }
 }
-static void wifi_start_and_wait_ip() { // L107: Wi-Fi init + block until IP
-    ESP_ERROR_CHECK(esp_netif_init()); // L108: initialize netif
-    ESP_ERROR_CHECK(esp_event_loop_create_default()); // L109: create event loop
-    esp_netif_create_default_wifi_sta(); // L110: create default station
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT(); // L112: default Wi-Fi config
-    ESP_ERROR_CHECK(esp_wifi_init(&cfg)); // L113: init Wi-Fi
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, nullptr, nullptr)); // L115: register Wi-Fi handler
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_ip, nullptr, nullptr)); // L116: register IP handler
-
-    wifi_config_t sta{}; // L118: zero-init Wi-Fi STA config
-    std::strncpy(reinterpret_cast<char*>(sta.sta.ssid), CONFIG_ECOWATT_WIFI_SSID, sizeof(sta.sta.ssid)-1); // L119–L120: set SSID
-    std::strncpy(reinterpret_cast<char*>(sta.sta.password), CONFIG_ECOWATT_WIFI_PASS, sizeof(sta.sta.password)-1); // L121–L122: set password
-    sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK; // L123: force WPA2
-
-    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA)); // L125: set mode STA
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta)); // L126: apply config
-    ESP_ERROR_CHECK(esp_wifi_start()); // L127: start Wi-Fi
-
-    s_evt = xEventGroupCreate(); // L129: create event group
-    (void)xEventGroupWaitBits(s_evt, BIT_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000)); // L130: wait up to 20s
+static void on_ip(void*, esp_event_base_t base, int32_t id, void* data) {
+  if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+    auto* e = static_cast<ip_event_got_ip_t*>(data);
+    ESP_LOGI(TAG, "Got IP: " IPSTR, IP2STR(&e->ip_info.ip));
+    xEventGroupSetBits(s_evt, BIT_GOT_IP);
+  }
+}
+static void wifi_start_and_wait_ip() {
+  ESP_ERROR_CHECK(esp_netif_init());
+  ESP_ERROR_CHECK(esp_event_loop_create_default());
+  esp_netif_create_default_wifi_sta();
+  wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+  ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+  s_evt = xEventGroupCreate();
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &on_wifi, nullptr, nullptr));
+  ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &on_ip, nullptr, nullptr));
+  wifi_config_t sta{}; std::strncpy((char*)sta.sta.ssid, CONFIG_ECOWATT_WIFI_SSID, sizeof(sta.sta.ssid)-1);
+  std::strncpy((char*)sta.sta.password, CONFIG_ECOWATT_WIFI_PASS, sizeof(sta.sta.password)-1);
+  sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
+  ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+  ESP_ERROR_CHECK(esp_wifi_start());
+  // s_evt = xEventGroupCreate();
+  (void)xEventGroupWaitBits(s_evt, BIT_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
 }
 
-// --------- NTP sync ---------
-static void sntp_sync_cb(struct timeval *tv) { // L134: callback when NTP sync
-    (void)tv; // L135: unused
-    struct timeval now{}; // L136: current time
-    gettimeofday(&now, nullptr); // L137: fill struct
-    int64_t epoch_ms = (int64_t)now.tv_sec * 1000LL + (now.tv_usec / 1000); // L138–L139: epoch ms
-    int64_t mono_ms  = (int64_t)monotonic_ms(); // L140: monotonic ms
-    s_epoch_offset_ms = epoch_ms - mono_ms; // L141: compute offset
-    ESP_LOGI(TAG, "NTP sync: epoch_ms=%lld mono_ms=%lld offset_ms=%lld",
-             (long long)epoch_ms, (long long)mono_ms, (long long)s_epoch_offset_ms); // L142–L144: log values
-    xEventGroupSetBits(s_evt, BIT_NTP_OK); // L145: mark NTP OK
+static void sntp_sync_cb(struct timeval *tv) {
+  (void)tv;
+  struct timeval now{}; gettimeofday(&now, nullptr);
+  int64_t epoch_ms = (int64_t)now.tv_sec * 1000LL + (now.tv_usec / 1000);
+  int64_t mono_ms  = (int64_t)monotonic_ms();
+  s_epoch_offset_ms = epoch_ms - mono_ms;
+  ESP_LOGI(TAG, "NTP sync: epoch_ms=%lld mono_ms=%lld offset_ms=%lld",
+           (long long)epoch_ms, (long long)mono_ms, (long long)s_epoch_offset_ms);
+  xEventGroupSetBits(s_evt, BIT_NTP_OK);
 }
-static void ntp_start_and_wait_blocking(uint32_t max_wait_ms) { // L147: start SNTP and wait
-    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL); // L148: set poll mode
-    esp_sntp_setservername(0, CONFIG_ECOWATT_NTP_SERVER); // L149: set server
-    esp_sntp_set_time_sync_notification_cb(sntp_sync_cb); // L150: callback
-    esp_sntp_init(); // L151: start SNTP
+static void ntp_start_and_wait_blocking(uint32_t max_wait_ms) {
+  esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+  esp_sntp_setservername(0, "pool.ntp.org");
+  esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
+  esp_sntp_init();
+  EventBits_t bits = xEventGroupWaitBits(s_evt, BIT_NTP_OK, pdFALSE, pdFALSE, pdMS_TO_TICKS(max_wait_ms));
+  if ((bits & BIT_NTP_OK) == 0) ESP_LOGW(TAG, "NTP sync timed out; acquisition continues without epoch offset");
+}
 
-    EventBits_t bits = xEventGroupWaitBits(
-        s_evt, BIT_NTP_OK, pdFALSE, pdFALSE, pdMS_TO_TICKS(max_wait_ms)
-    ); // L153–L155: wait for NTP OK
-    if ((bits & BIT_NTP_OK) == 0) { // L156: timed out
-        ESP_LOGW(TAG, "NTP sync timed out; delaying acquisition until next sync"); // L157
-    }
-}
 
 // ------------------ Tasks ------------------
-static acquisition::Acquisition* g_acq = nullptr; // L161: global pointer to acquisition driver
+static void task_acq(void*){
+  if ((xEventGroupGetBits(s_evt) & BIT_NTP_OK) == 0) {
+    xEventGroupWaitBits(s_evt, BIT_NTP_OK, pdFALSE, pdFALSE, pdMS_TO_TICKS(60000));
+  }
+  TickType_t last = xTaskGetTickCount();
+  uint32_t period_ms = g_cfg_cur.sampling_interval_ms;
+  TickType_t period_ticks = pdMS_TO_TICKS(period_ms);
 
-static void task_acq(void*){ // L163: acquisition task
-    if ((xEventGroupGetBits(s_evt) & BIT_NTP_OK) == 0) { // L164: check NTP ready
-        xEventGroupWaitBits(s_evt, BIT_NTP_OK, pdFALSE, pdFALSE, pdMS_TO_TICKS(60000)); // L165: wait 60s
+  while(true){
+    acquisition::Sample s{};
+    std::vector<int> fids; for(auto f: g_cfg_cur.fields) fids.push_back((int)f);
+    if(!fids.empty()) g_acq->read_selected(fids, s); else g_acq->read_all(s);
+
+    buffer::Record rec{ now_ms_epoch(), s };
+    xSemaphoreTake(g_ring_mtx, portMAX_DELAY); g_ring->push(rec); xSemaphoreGive(g_ring_mtx);
+
+    ESP_LOGI(TAG, "ACQ tick @ %" PRIu64 " ms (epoch)", rec.epoch_ms);
+    vTaskDelayUntil(&last, period_ticks);
+    if(period_ms != g_cfg_cur.sampling_interval_ms){
+      period_ms   = g_cfg_cur.sampling_interval_ms;
+      period_ticks= pdMS_TO_TICKS(period_ms);
     }
-
-    TickType_t last = xTaskGetTickCount(); // L167: last tick count
-    uint32_t period_ticks = pdMS_TO_TICKS(CONFIG_ECOWATT_SAMPLE_PERIOD_MS); // L168: convert period
-
-    while(true){ // L170: forever
-        acquisition::Sample s{}; // L171: empty sample
-        g_acq->read_all(s); // L172: fill sample
-
-        uint64_t t_epoch_ms = now_ms_epoch(); // L174: get epoch ms
-        buffer::Record rec{ t_epoch_ms, s }; // L175: make record
-
-        xSemaphoreTake(g_ring_mtx, portMAX_DELAY); // L177: lock ring
-        g_ring->push(rec); // L178: push into ring
-        xSemaphoreGive(g_ring_mtx); // L179: release
-
-        ESP_LOGI(TAG, "ACQ tick @ %" PRIu64 " ms (epoch)", t_epoch_ms); // L181: log tick
-        vTaskDelayUntil(&last, period_ticks); // L182: periodic delay
-    }
+  }
 }
 
-static void task_uplink(void*){ // L185: uplink task
-    TickType_t last = xTaskGetTickCount(); // L186: last tick
-    const TickType_t period = pdMS_TO_TICKS(CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC * 1000); // L187: convert upload interval
+static void task_uplink(void*){
+  TickType_t last = xTaskGetTickCount();
+  const TickType_t period = pdMS_TO_TICKS(CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC * 1000);
 
-    while(true){ // L189: forever
-        std::vector<buffer::Record> batch; // L190: buffer
+  while(true){
+    if(g_has_pending_cfg){
+      g_cfg_cur = g_cfg_next;
+      g_has_pending_cfg = false;
+      std::string cfg_json = "{\"sampling_interval\":" + std::to_string(g_cfg_cur.sampling_interval_ms/1000) + "}";
+      nvstore::set_str("cfg","runtime", cfg_json);
+    }
 
-        xSemaphoreTake(g_ring_mtx, portMAX_DELAY); // L192: lock
-        batch = g_ring->snapshot_and_clear(); // L193: take snapshot
-        xSemaphoreGive(g_ring_mtx); // L194: release
+    std::vector<buffer::Record> batch;
+    xSemaphoreTake(g_ring_mtx, portMAX_DELAY);
+    batch = g_ring->snapshot_and_clear();
+    xSemaphoreGive(g_ring_mtx);
 
-        if(!batch.empty()){ // L196: if data
-            auto payload = uplink::build_payload(batch, CONFIG_ECOWATT_DEVICE_ID); // L197: build JSON
-            bool ok = uplink::post_payload(CONFIG_ECOWATT_CLOUD_BASE_URL,
-                                           CONFIG_ECOWATT_CLOUD_KEY_B64,
-                                           payload.json); // L198–L200: send to cloud
-            ESP_LOGI(TAG, "upload: samples=%u, compressed=%zu bytes, ok=%d",
-                     (unsigned)batch.size(), payload.raw_bytes, ok); // L201–L202
-        }else{
-            ESP_LOGI(TAG, "upload: no samples in window"); // L204: nothing
+    std::string body_json;
+    if(!batch.empty()){
+      codec::BenchResult br = codec::run_benchmark_delta_rle_v1(batch);
+      double ratio = (br.comp_bytes>0)? double(br.orig_bytes)/double(br.comp_bytes) : 0.0;
+      ESP_LOGI(TAG,"[BENCH] n=%u orig=%uB comp=%uB ratio=%.2fx encode=%.3fms lossless=%s",
+               (unsigned)br.n_samples,(unsigned)br.orig_bytes,(unsigned)br.comp_bytes,ratio,br.encode_ms,br.lossless_ok?"yes":"NO");
+      auto payload = uplink::build_payload(batch, CONFIG_ECOWATT_DEVICE_ID);
+
+      std::string extra = control::to_json_status(g_cmd_res);
+      if(!extra.empty() && extra!="{}" && payload.json.back()=='}'){
+        std::string j = payload.json; j.pop_back();
+        if(extra.front()=='{') extra.erase(0,1);
+        body_json = j + "," + extra;  // merged into root
+      }
+      if(body_json.empty()) body_json = payload.json;
+    } else {
+      body_json = std::string("{\"device_id\":\"") + CONFIG_ECOWATT_DEVICE_ID + "\",\"ts_start\":0,\"ts_end\":0,"
+                  "\"seq\":0,\"codec\":\"none\",\"order\":[],\"block_b64\":\"\"}";
+      ESP_LOGI(TAG, "upload: no samples");
+    }
+    // Add FOTA status if present
+    if (g_fota_progress.has) {
+      uint32_t pct = (g_fota_progress.total>0)
+                    ? (uint32_t)((100ULL*g_fota_progress.written)/g_fota_progress.total)
+                    : 0;
+      // append: "fota":{"progress":pct,"next_chunk": S.next_chunk }
+      char buf[96];
+      snprintf(buf, sizeof(buf),
+        ",\"fota\":{\"progress\":%lu,\"next_chunk\":%lu}",
+        (unsigned long)pct, (unsigned long)fota::get_next_chunk_for_cloud());
+
+      if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
+      g_fota_progress.has = false;
+    }
+    // One-shot verify/apply report (after finalize)
+    if (g_fota_report.has){
+      const char* v = g_fota_report.verify_ok ? "ok" : "fail";
+      const char* a = g_fota_report.apply_ok  ? "ok" : "fail";
+      char buf[96];
+      snprintf(buf,sizeof(buf),",\"fota\":{\"verify\":\"%s\",\"apply\":\"%s\"}", v, a);
+      if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
+      g_fota_report.has = false;
+    }
+
+    // One-shot boot confirmation (set in app_main after cancel_rollback)
+    if (g_fota_bootack.has){
+      char buf[64];
+      snprintf(buf,sizeof(buf),",\"fota\":{\"boot_ok\":true}");
+      if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
+      g_fota_bootack.has = false;
+    }
+
+    
+    // Envelope
+    std::string psk = CONFIG_ECOWATT_PSK;
+    std::string to_send = body_json;
+    if (CONFIG_ECOWATT_USE_ENVELOPE) {
+      ++g_device_nonce; nvstore::set_u64("sec","nonce_device", g_device_nonce);
+      to_send = security::wrap_json_with_hmac(body_json, psk, g_device_nonce);
+    }
+
+    std::string reply;
+    bool ok = uplink::post_payload_and_get_reply(CONFIG_ECOWATT_CLOUD_BASE_URL, CONFIG_ECOWATT_CLOUD_KEY_B64, to_send, reply);
+    ESP_LOGI(TAG, "upload POST ok=%d, reply bytes=%u", ok?1:0, (unsigned)reply.size());
+
+    std::string inner = reply;
+    if (ok && CONFIG_ECOWATT_USE_ENVELOPE && !reply.empty()) {
+      auto unwrap = security::unwrap_and_verify_envelope(reply, psk, g_last_cloud_nonce, /*server uses b64*/ true);
+      if(unwrap){ inner = *unwrap; nvstore::set_u64("sec","nonce_cloud", g_last_cloud_nonce); }
+      else { inner.clear(); ESP_LOGW(TAG, "bad HMAC or replay in cloud reply — ignored"); }
+    }
+
+    if(!inner.empty()){
+      // config_update
+      if(inner.find("\"config_update\"") != std::string::npos){
+        uint32_t si_sec = 0; auto p = inner.find("\"sampling_interval\"");
+        if(p!=std::string::npos){ p = inner.find(':', p); if(p!=std::string::npos) si_sec = std::strtoul(inner.c_str()+p+1,nullptr,10); }
+        std::vector<std::string> regs;
+        auto rpos = inner.find("\"registers\"");
+        if(rpos!=std::string::npos){
+          rpos = inner.find('[', rpos); auto r2 = inner.find(']', rpos);
+          if(rpos!=std::string::npos && r2!=std::string::npos && r2>rpos){
+            std::string arr = inner.substr(rpos+1, r2-rpos-1);
+            size_t i=0; while(true){ auto q1=arr.find('"',i); if(q1==std::string::npos) break;
+              auto q2=arr.find('"',q1+1); if(q2==std::string::npos) break; regs.push_back(arr.substr(q1+1,q2-q1-1)); i=q2+1; }
+          }
         }
-        vTaskDelayUntil(&last, period); // L205: wait interval
+        control::RuntimeConfig next = g_cfg_cur;
+        if(si_sec>0) next.sampling_interval_ms = si_sec*1000U;
+        if(!regs.empty()){ std::vector<control::FieldId> f; if(control::map_field_names(regs, f)) next.fields = f; }
+        g_cfg_next = next; g_has_pending_cfg = true;
+        ESP_LOGI(TAG, "queued config: sampling=%" PRIu32 "ms fields=%u", g_cfg_next.sampling_interval_ms, (unsigned)g_cfg_next.fields.size());
+      }
+      // command
+      if(inner.find("\"command\"") != std::string::npos){
+        auto vpos = inner.find("\"value\""); int val=-1;
+        if(vpos!=std::string::npos){ vpos = inner.find(':', vpos); if(vpos!=std::string::npos) val = std::strtol(inner.c_str()+vpos+1, nullptr, 10); }
+        if(val>=0){ g_cmd.has_cmd = true; g_cmd.export_pct = val; g_cmd.received_at_ms = now_ms_epoch(); }
+      }
+      // // FOTA
+      // if(inner.find("\"fota\"") != std::string::npos){
+      //   auto mpos = inner.find("\"manifest\"");
+      //   if(mpos!=std::string::npos){
+      //     fota::Manifest mf{};
+      //     auto v = inner.find("\"version\"", mpos); if(v!=std::string::npos){ v = inner.find('"', v+9); auto e=inner.find('"', v+1); mf.version = inner.substr(v+1, e-v-1); }
+      //     auto s = inner.find("\"size\"", mpos);    if(s!=std::string::npos){ s = inner.find(':', s); mf.size = std::strtoul(inner.c_str()+s+1,nullptr,10); }
+      //     auto h = inner.find("\"hash\"", mpos);    if(h!=std::string::npos){ h = inner.find('"', h+6); auto e=inner.find('"', h+1); mf.hash_hex = inner.substr(h+1, e-h-1); }
+      //     auto cs= inner.find("\"chunk_size\"", mpos); if(cs!=std::string::npos){ cs = inner.find(':', cs); mf.chunk_size = std::strtoul(inner.c_str()+cs+1,nullptr,10); }
+      //     fota::start(mf);
+      //   }
+      //   // auto cpos = inner.find("\"chunk_number\"");
+      //   // if(cpos!=std::string::npos){
+      //   //   cpos = inner.find(':', cpos); uint32_t num = std::strtoul(inner.c_str()+cpos+1,nullptr,10);
+      //   //   auto d = inner.find("\"data\""); std::string data;
+      //   //   if(d!=std::string::npos){ d = inner.find('"', d+6); auto e=inner.find('"', d+1); data = inner.substr(d+1, e-d-1); }
+      //   //   if(!data.empty()) fota::ingest_chunk(num, data);
+      //   // }
+      //   // NEW (anchor the search inside the fota object and after cpos)
+      //   auto fpos = inner.find("\"fota\"");
+      //   if (fpos != std::string::npos) {
+      //     auto cpos = inner.find("\"chunk_number\"", fpos);
+      //     if (cpos != std::string::npos) {
+      //       auto colon = inner.find(':', cpos);
+      //       uint32_t num = std::strtoul(inner.c_str()+colon+1, nullptr, 10);
+
+      //       auto d = inner.find("\"data\"", cpos);   // <-- key line: search AFTER chunk_number
+      //       if (d != std::string::npos) {
+      //         d = inner.find('"', d + 6);
+      //         auto e = inner.find('"', d + 1);
+      //         std::string data = inner.substr(d + 1, e - d - 1);
+      //         if(!data.empty()) fota::ingest_chunk(num, data);
+      //       }
+      //     }
+      //   }
+      // }
+
+    // FOTA
+    {
+      auto fpos = inner.find("\"fota\"");
+      if (fpos != std::string::npos) {
+
+        // Parse manifest if present
+        auto mpos = inner.find("\"manifest\"", fpos);
+        if (mpos != std::string::npos) {
+          fota::Manifest mf{};
+          auto v  = inner.find("\"version\"",    mpos);
+          auto sz = inner.find("\"size\"",       mpos);
+          auto hh = inner.find("\"hash\"",       mpos);
+          auto cs = inner.find("\"chunk_size\"", mpos);
+
+          if (v  != std::string::npos) { auto q1 = inner.find('"', v+9);  auto q2 = inner.find('"', q1+1);  mf.version   = inner.substr(q1+1, q2-q1-1); }
+          if (sz != std::string::npos) { auto c  = inner.find(':', sz);   mf.size       = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
+          if (hh != std::string::npos) { auto q1 = inner.find('"', hh+6); auto q2 = inner.find('"', q1+1);  mf.hash_hex   = inner.substr(q1+1, q2-q1-1); }
+          if (cs != std::string::npos) { auto c  = inner.find(':', cs);   mf.chunk_size = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
+
+          fota::start(mf);
+        }
+
+        // Parse and ingest chunk if present
+        auto cpos = inner.find("\"chunk_number\"", fpos);
+        if (cpos != std::string::npos) {
+          auto colon = inner.find(':', cpos);
+          uint32_t num = std::strtoul(inner.c_str()+colon+1, nullptr, 10);
+
+          // IMPORTANT: search for "data" AFTER the chunk_number occurrence
+          auto d = inner.find("\"data\"", cpos);
+          if (d != std::string::npos) {
+            d = inner.find('"', d + 6);
+            auto e = inner.find('"', d + 1);
+            if (d != std::string::npos && e != std::string::npos && e > d) {
+              std::string data = inner.substr(d + 1, e - d - 1);
+              if (!data.empty()) {
+                fota::ingest_chunk(num, data);
+              }
+            }
+          }
+        }
+      }
     }
+
+    }
+    
+    // // After FOTA manifest/chunk handling in task_uplink()
+    //   bool ok_verify=false, ok_apply=false;
+    //   if (fota::finalize_and_apply(ok_verify, ok_apply)) {
+    //     ESP_LOGI(TAG, "FOTA finalize: verify=%d apply(reboot)=%d", ok_verify?1:0, ok_apply?1:0);
+    //   }
+    // After FOTA manifest/chunk handling in task_uplink()
+    bool ok_verify=false, ok_apply=false;
+    if (fota::finalize_and_apply(ok_verify, ok_apply)) {
+      // Defer reporting to the next payload
+      g_fota_report.has = true;
+      g_fota_report.verify_ok = ok_verify;
+      g_fota_report.apply_ok  = ok_apply;
+      ESP_LOGI(TAG, "FOTA finalize: verify=%d apply(reboot)=%d", ok_verify?1:0, ok_apply?1:0);
+    }
+
+    // Execute staged command now; report in next slot
+    if(g_cmd.has_cmd){
+      bool okw = g_acq->set_export_power(g_cmd.export_pct, "cloud_cmd");
+      g_cmd_res.has_result = true; g_cmd_res.success = okw;
+      g_cmd_res.executed_at_ms = now_ms_epoch(); g_cmd_res.value = g_cmd.export_pct;
+      g_cmd.has_cmd = false;
+    } else {
+      if(g_cmd_res.has_result){ g_cmd_res.has_result=false; }
+    }
+
+    vTaskDelayUntil(&last, period);
+  }
 }
 
-extern "C" void app_main(void) { // L208: entry point
-    ESP_ERROR_CHECK(nvs_flash_init()); // L209: init NVS
-    wifi_start_and_wait_ip(); // L210: Wi-Fi
-    ntp_start_and_wait_blocking(/*max_wait_ms=*/60000);  // L211: wait for time
+// ------------------ app_main ------------------
+extern "C" void app_main(void) {
+  nvstore::init();
+  uint64_t tmp=0;
+  if(nvstore::get_u64("sec","nonce_device", tmp)) g_device_nonce = tmp;
+  if(nvstore::get_u64("sec","nonce_cloud", tmp))  g_last_cloud_nonce = tmp;
+  const esp_partition_t* running = esp_ota_get_running_partition();
+  esp_ota_img_states_t ota_state;
+  if (esp_ota_get_state_partition(running, &ota_state) == ESP_OK &&
+      ota_state == ESP_OTA_IMG_PENDING_VERIFY) {
+    // Our app has started successfully: mark it valid and cancel rollback
+    esp_ota_mark_app_valid_cancel_rollback();
+    ESP_LOGI(TAG, "OTA image marked valid (cancel rollback).");
+    g_fota_bootack.has = true;
+  }
+  ESP_ERROR_CHECK(nvs_flash_init());
+  wifi_start_and_wait_ip();
+  ntp_start_and_wait_blocking(60000);
 
-    static acquisition::Acquisition acq(CONFIG_ECOWATT_API_BASE_URL, CONFIG_ECOWATT_API_KEY_B64); // L213–L214: acquisition driver
-    g_acq = &acq; // L215: store pointer
-    acq.set_export_power(10, "boot"); // L216: set initial export power
+  static acquisition::Acquisition acq(CONFIG_ECOWATT_API_BASE_URL, CONFIG_ECOWATT_API_KEY_B64);
+  g_acq = &acq;
+  acq.set_export_power(10, "boot");
 
-    const size_t cap = (CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC * 1000 / CONFIG_ECOWATT_SAMPLE_PERIOD_MS) + 16; // L218: ring capacity
-    static buffer::Ring ring(cap); // L219: create ring
-    g_ring = &ring; // L220: store pointer
+  g_cfg_cur.sampling_interval_ms = CONFIG_ECOWATT_SAMPLE_PERIOD_MS;
+  g_cfg_next = g_cfg_cur;
 
-    g_ring_mtx = xSemaphoreCreateMutex(); // L222: create mutex
+  const size_t cap = (CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC * 1000 / CONFIG_ECOWATT_SAMPLE_PERIOD_MS) + 16;
+  static buffer::Ring ring(cap);
+  g_ring = &ring; g_ring_mtx = xSemaphoreCreateMutex();
 
-    xTaskCreatePinnedToCore(task_acq,    "acq",    4096, nullptr, 5, nullptr, 0); // L224: create acq task
-    xTaskCreatePinnedToCore(task_uplink, "uplink", 4096, nullptr, 5, nullptr, 0); // L225: create uplink task
+  fota::init();
+
+  xTaskCreatePinnedToCore(task_acq,   "acq",   4096, nullptr, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(task_uplink,"uplink",8192, nullptr, 5, nullptr, 0);
 }
-
-
