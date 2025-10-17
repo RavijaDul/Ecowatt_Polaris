@@ -1,25 +1,25 @@
-#pragma once                                  // L1: single-inclusion guard.
+#pragma once
+#include <cstddef>
+#include <string>
+#include <vector>
+#include "buffer.hpp"
+#include "acquisition.hpp"
 
-#include <cstdint>                            // L3: integer types.
-#include <string>                             // L4: std::string for blobs.
-#include <vector>                             // L5: std::vector for batches.
-#include "buffer.hpp"                         // L6: for buffer::Record.
-#include "acquisition.hpp"                    // L7: for acquisition::Sample.
+namespace codec {
+uint32_t crc32_ieee(const void* data, size_t len);
 
-namespace codec {                             // L9: begin codec namespace.
+std::string encode_delta_rle_v1(const std::vector<buffer::Record>& recs, std::vector<std::string>& order);
+bool decode_delta_rle_v1(const std::string& blob, std::vector<acquisition::Sample>& out_samples, std::vector<std::string>* out_order = nullptr);
 
-// CRC32 helper
-uint32_t crc32_ieee(const void* data, size_t len); // L12: calculate CRC-32 of buffer.
+struct BenchResult {
+  std::string method;
+  size_t n_samples = 0;
+  size_t orig_bytes = 0;
+  size_t comp_bytes = 0;
+  double encode_ms = 0.0;
+  bool lossless_ok = false;
+};
 
-// Encode a batch of records into delta+RLE compressed binary blob.
-// Returns binary string and fills 'order' with field names used.
-std::string encode_delta_rle_v1(const std::vector<buffer::Record>& recs,
-                                std::vector<std::string>& order); // L16–L17
+codec::BenchResult run_benchmark_delta_rle_v1(const std::vector<buffer::Record>& recs);
 
-// Decode delta+RLE blob back into samples.
-// Returns true on success, false on CRC or format error.
-bool decode_delta_rle_v1(const std::string& blob,
-                         std::vector<acquisition::Sample>& out_samples,
-                         std::vector<std::string>* out_order=nullptr); // L21–L23
-
-} // namespace codec                           // L25
+} // namespace codec

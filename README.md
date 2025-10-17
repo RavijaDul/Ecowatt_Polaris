@@ -1,135 +1,145 @@
-| Supported Targets | ESP32 | ESP32-C2 | ESP32-C3 | ESP32-C5 | ESP32-C6 | ESP32-C61 | ESP32-H2 | ESP32-H21 | ESP32-H4 | ESP32-P4 | ESP32-S2 | ESP32-S3 | Linux |
-| ----------------- | ----- | -------- | -------- | -------- | -------- | --------- | -------- | --------- | -------- | -------- | -------- | -------- | ----- |
+# EcoWatt ESP-IDF Project
 
-# EcoWatt - Milestone 03: Local Buffering, Compression, and Upload Cycle
+This project implements an EcoWatt device using ESP-IDF for data acquisition, compression, and over-the-air (OTA) firmware updates (FOTA).
 
-## Project Overview
+## Prerequisites
 
-### Background
-EcoWatt is building a small embedded device called EcoWatt Device that pretends it is plugged into a real solar inverter. Because we don't have a physical inverter for the project, the device talks to an online Inverter SIM service that behaves like a real inverter: it answers register read requests and accepts configuration write commands.  
-
-In this milestone, the device extends its functionality by buffering samples locally, compressing them with a lightweight codec, and periodically uploading compressed payloads to the EcoWatt Cloud.
-
-### What the System Does
-- **Read a lot, send a little**: The EcoWatt Device can read inverter data frequently but is restricted to uploading once every 15 minutes. It must buffer, compress, and package samples before transmission.  
-- **Local buffering**: Samples are stored in a ring buffer until the next upload window.  
-- **Compression**: Implements delta + run-length encoding (RLE v1) with CRC32 integrity checks.  
-- **Periodic upload**: Data batches are compressed, encoded in Base64, and sent to the EcoWatt Cloud API endpoint.  
-- **Benchmarking**: Compression efficiency is measured and reported (original vs compressed size, ratio, CPU overhead, lossless recovery).  
-
-## Core Objective
-Enhance the EcoWatt Device to:
-- Buffer acquired samples for the entire upload interval without loss.  
-- Apply a compression method (delta/RLE v1) and validate decompression integrity.  
-- Build uplink payloads containing timestamps, codec metadata, and compressed data.  
-- Upload payloads to EcoWatt Cloud at fixed intervals (15 minutes, simulated as 15 seconds for testing).  
-
-## Actors & Channels
-- **EcoWatt Device** (ESP32 MCU – the "slave")  
-- **EcoWatt Cloud** (receives compressed payloads, ACKs, commands)  
-- **Inverter SIM** (emulates inverter registers for acquisition)  
-
-### Inverter SIM Deployment Options
-- **Cloud API Mode** – EcoWatt Device communicates with Inverter SIM over HTTP REST.  
-- **PC Modbus Mode** – (not used in this milestone, but supported).  
-
-## Transport Constraints
-- **EcoWatt Device → EcoWatt Cloud**: upload once every 15 minutes (simulated as 15 seconds).  
-- **EcoWatt Device ↔ Inverter SIM**: high-frequency polling (e.g., 5 seconds).  
-
-## EcoWatt Device Functional Blocks
-- **Protocol Adapter Layer**: Formats Modbus requests, parses responses from Inverter SIM.  
-- **Acquisition Scheduler**: Polls inverter registers periodically.  
-- **Local Buffer**: Thread-safe ring buffer stores acquired records until next upload window.  
-- **Compression Codec**: Delta + RLE v1 encoding with CRC-32 validation. Lossless decompression verified.  
-- **Uplink Packetizer**: Builds JSON payloads with timestamps, field order, and Base64-encoded compressed block.  
-- **Upload Cycle**: Posts payloads to EcoWatt Cloud endpoint; logs success/failure.  
-
-## Key Workflows
-- **Acquisition Loop**: Poll Inverter SIM → buffer sample → repeat.  
-- **Upload Cycle**: Every 15 min/15 sec → snapshot buffer → compress → build payload → upload to cloud.  
-- **Compression Benchmarking**: Measure payload size before/after compression, ratio, and CPU overhead.  
-
-## Milestone Breakdown
-### Milestone 1: System Modeling with Petri Nets and Scaffold Implementation (10%)  
-### Milestone 2: Inverter SIM Integration and Basic Acquisition (20%)  
-### Milestone 3: Local Buffering, Compression, and Upload Cycle (20%)  
-- **Objective**: Implement local buffering, compression algorithm, and upload cycle.  
-- **Scope**:  
-  - Buffering: Ring buffer to store samples until upload window.  
-  - Compression: Delta + RLE v1 codec with CRC. Benchmark compression ratio and verify lossless decompression.  
-  - Uplink: Build JSON payloads and post to EcoWatt Cloud API.  
-
-## Hardware Requirements
-- ESP32 development board  
-- Wi-Fi connectivity  
-- USB cable for programming and debugging  
-
-## Software Requirements
-- ESP-IDF framework (latest stable version)  
-- CMake build system  
-- Python 3.7 or later (for testing/benchmarking scripts)  
-- Git for version control  
-
-## Build and Flash Instructions
-```bash
-# Setup ESP-IDF environment
-idf.py set-target esp32
-idf.py menuconfig   # Configure Wi-Fi, SIM endpoints, Cloud endpoints
-idf.py build
-idf.py -p <PORT> flash
-idf.py -p <PORT> monitor
-```
-## Project Structure
-```
-
-├── CMakeLists.txt
-├── sdkconfig
-├── main/
-│   ├── main.cpp             # Application entry point (tasks for acquisition + upload)
-│   ├── buffer.cpp/.hpp      # Thread-safe ring buffer
-│   ├── acquisition.cpp/.hpp # Data acquisition (Modbus over HTTP transport)
-│   ├── modbus.cpp/.hpp      # Modbus request/response handling
-│   ├── codec.cpp/.hpp       # Delta + RLE compression/CRC
-│   ├── packetizer.cpp/.hpp  # Payload builder + uploader
-│   ├── transport_idf.cpp    # HTTP client transport
-│   └── Kconfig.projbuild
-```
-
-## Usage
-1. Device connects to Wi-Fi and synchronizes time via NTP.  
-2. Acquisition task polls Inverter SIM every 5 seconds.  
-3. Records are pushed into the ring buffer.  
-4. Every 15 seconds (demo) or 15 minutes (real), uplink task:  
-   - Takes snapshot of buffer  
-   - Compresses with codec  
-   - Builds JSON payload with metadata + compressed block  
-   - Uploads to EcoWatt Cloud endpoint  
-5. Monitor serial logs for acquisition ticks, payload size, compression ratio, and upload status.  
+- ESP-IDF v5.4.2 installed and configured.
+- Python 3.x for the server.
+- PowerShell (for Windows) or equivalent shell for firmware preparation.
 
 ## Configuration
-- Wi-Fi SSID and password  
-- Inverter SIM base URL and API key  
-- Cloud server URL and API key  
-- Sampling period (ms)  
-- Upload interval (sec)  
 
-## Troubleshooting
-- **Buffer Overflow**: Increase ring buffer capacity if too many samples before upload.  
-- **Upload Failures**: Check Wi-Fi, cloud API availability, and endpoint URL.  
-- **Compression Errors**: Verify encoding/decoding with CRC.  
-- **Build Issues**: Ensure ESP-IDF is installed and PATH configured.  
+Before building, ensure the following settings in `sdkconfig`:
 
-## Evaluation Criteria
-- Correct buffering implementation and data integrity (20%)  
-- Compression efficiency and benchmark quality (20%)  
-- Robustness and correctness of packetizer + upload logic (20%)  
-- Correct cloud API implementation (20%)  
-- Clarity of demo video (10%)  
-- Code readability and modularity (10%)  
+1. Run `idf.py menuconfig`.
+2. Navigate to **Serial flasher config** > **Flash size** and set to **4MB**.
+3. Navigate to **Bootloader config** > **Bootloader manager** and enable **Enable app rollback support**.
+4. Navigate to **Partition Table** and set to **Factory app, two OTA definitions**.
+5. Save and exit.
 
-## Technical Support
-- ESP-IDF Docs: https://docs.espressif.com/projects/esp-idf/  
-- ESP32 Forums: https://esp32.com/  
-- Inverter SIM API docs: [Provided Link]  
-- GitHub Issues: for reporting bugs and requests  
+Alternatively, the `sdkconfig` file is already configured with these settings:
+- `CONFIG_ESPTOOLPY_FLASHSIZE="4MB"`
+- `CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y`
+- `CONFIG_PARTITION_TABLE_TWO_OTA=y`
+
+## Building and Flashing
+
+1. Build the project:
+   ```
+   idf.py build
+   ```
+
+2. Flash the firmware to the ESP32:
+   ```
+   idf.py flash
+   ```
+
+   The ESP-IDF output will display build and flash progress, including partition information and flash operations.
+
+## Running the Server
+
+The server (`server/app.py`) handles data uploads from devices and serves FOTA updates.
+
+1. Navigate to the `server` directory:
+   ```
+   cd server
+   ```
+
+2. Install dependencies (if not already done):
+   ```
+   pip install -r requirements.txt
+   ```
+
+3. Prepare the firmware binary for FOTA by running the following commands in PowerShell (one-time setup) in server folder:
+
+   ```powershell
+   Remove-Item .\logs -Recurse -Force -ErrorAction SilentlyContinue
+   New-Item -ItemType Directory .\logs | Out-Null
+
+   $logs  = "$PWD\logs"
+   $bin   = "..\build\ecowatt.bin"  
+   $chunk = 8192
+   $ver   = "1.0.4"   # bump version to force a fresh session
+   $bytes = [IO.File]::ReadAllBytes($bin)
+   $size  = $bytes.Length
+   $hash  = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLower()
+
+   # write manifest WITHOUT BOM
+   $mf = ('{{"version":"{0}","size":{1},"hash":"{2}","chunk_size":{3}}}' -f $ver,$size,$hash,$chunk)
+   Set-Content -Path (Join-Path $logs "fota_manifest.json") -Value $mf -Encoding Ascii -NoNewline
+
+   # split to 0000, 0001, ...
+   $i=0
+   for ($off=0; $off -lt $size; $off += $chunk) {
+     $len=[Math]::Min($chunk,$size-$off)
+     $b64=[Convert]::ToBase64String($bytes,$off,$len)
+     Set-Content -Path (Join-Path $logs ("fota_chunk_{0:D4}.b64" -f $i)) -Value $b64 -Encoding ASCII -NoNewline
+     $i++
+   }
+   "Created $i chunks for size $size (hash=$hash) at $logs"
+   $env:LOG_DIR = "$PWD\logs"
+   python .\app.py
+   ```
+
+   This script:
+   - Cleans and creates the `logs` directory.
+   - Reads the built `ecowatt.bin` from the `build` directory.
+   - Generates a FOTA manifest JSON file.
+   - Splits the binary into base64-encoded chunks.
+   - Starts the Flask server with the log directory set.
+
+4. The server will run on `http://localhost:5000` (or the configured port).
+
+## Usage
+
+- The ESP32 device will connect to Wi-Fi, acquire data, compress it, and upload to the server.
+- FOTA updates can be triggered by placing the manifest and chunks in the server's `logs` directory.
+- Access the admin dashboard at `http://localhost:5000/admin` to view uploads and FOTA progress.
+
+## Project Structure
+
+```
+EcoWatt/
+├── .clangd                 # Clangd configuration for C++ language server
+├── CMakeLists.txt          # ESP-IDF project root CMake file
+├── README.md               # This file
+├── sdkconfig               # ESP-IDF configuration file
+├── sdkconfig.old           # Backup of previous SDK config
+├── .vscode/                # VSCode workspace settings
+├── build/                  # Build artifacts (generated by idf.py build)
+├── logs/                   # Log files (generated)
+├── main/                   # ESP-IDF application source code
+│   ├── acquisition.cpp/.hpp  # Data acquisition from sensors
+│   ├── buffer.cpp/.hpp       # Data buffering
+│   ├── codec.cpp/.hpp        # Data compression codec
+│   ├── control.cpp/.hpp      # Runtime control and commands
+│   ├── fota.cpp/.hpp         # Firmware over-the-air update logic
+│   ├── main.cpp              # Application entry point
+│   ├── modbus.cpp/.hpp       # Modbus communication
+│   ├── nvstore.cpp/.hpp      # Non-volatile storage
+│   ├── packetizer.cpp/.hpp   # Data packetization
+│   ├── security.cpp/.hpp     # HMAC security envelope
+│   ├── transport_idf.cpp/.hpp # ESP-IDF transport layer
+│   ├── CMakeLists.txt        # Main component CMake file
+│   └── Kconfig               # Kconfig menu for main component
+├── server/                 # Python Flask server
+│   ├── app.py               # Flask application
+│   ├── requirements.txt     # Python dependencies
+│   ├── ecowatt.db           # SQLite database (generated)
+│   ├── demo_firmware.bin    # Demo firmware binary
+│   ├── .venv/               # Virtual environment (generated)
+│   └── logs/                # Server logs and FOTA files (generated)
+└── test/                   # Test scripts
+    ├── 10_queue_config.sh   # Config queuing test
+    ├── 20_queue_command.sh  # Command queuing test
+    ├── 30_security_bad_mac.py # Security test (bad MAC)
+    ├── 31_security_good_mac.py # Security test (good MAC)
+    └── 40_fota_pack.py      # FOTA packaging test
+```
+
+## Notes
+
+- Ensure the binary path in the PowerShell script matches your build output.
+- Update the version in the script for new firmware releases.
+- The server uses SQLite for data storage (`ecowatt.db`).

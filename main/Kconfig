@@ -1,0 +1,49 @@
+menu "EcoWatt Settings"
+
+config ECOWATT_WIFI_SSID
+    string "Wi-Fi SSID"
+    default "YOUR_WIFI_SSID"
+
+config ECOWATT_WIFI_PASS
+    string "Wi-Fi Password"
+    default "YOUR_WIFI_PASSWORD"
+
+config ECOWATT_API_BASE_URL
+    string "Inverter SIM Base URL"
+    default "http://20.15.114.131:8080"
+
+config ECOWATT_API_KEY_B64
+    string "Inverter SIM API key (Authorization header - e.g., 'Basic <base64>')"
+    default ""
+
+config ECOWATT_CLOUD_BASE_URL
+    string "EcoWatt Cloud Base URL (HTTP/HTTPS)"
+    default "http://192.168.99.159:5000"  
+
+config ECOWATT_CLOUD_KEY_B64
+    string "EcoWatt Cloud API key (Authorization header - e.g., 'Basic <base64>')"
+    default ""
+
+config ECOWATT_UPLOAD_INTERVAL_SEC
+    int "Upload interval seconds (15 demo / 900 real)"
+    range 5 3600
+    default 15
+
+config ECOWATT_SAMPLE_PERIOD_MS
+    int "Sampling period (ms)"
+    range 100 60000
+    default 5000
+
+config ECOWATT_DEVICE_ID
+    string "Device ID"
+    default "EcoWatt-Dev-01"
+
+config ECOWATT_PSK
+    string "Pre-shared key for HMAC (PSK)"
+    default "ecowatt-demo-psk"
+
+config ECOWATT_USE_ENVELOPE
+    bool "Use HMAC envelope for device↔cloud"
+    default y
+
+endmenu

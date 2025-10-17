@@ -16,7 +16,7 @@ venv/
 env/
 ENV/
 .venv/
-EcoWatt-LocalAPI/venv/
+server/venv/
 
 # --- Build / Packaging ---
 build/
@@ -53,4 +53,3 @@ Thumbs.db
 .env.*
 *.pem
 *.key
-
