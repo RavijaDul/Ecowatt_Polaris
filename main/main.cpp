@@ -15,7 +15,7 @@
 #define CONFIG_ECOWATT_API_KEY_B64 ""
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_BASE_URL
-#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.246.159:5000"
+#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.150.146:5000"
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_KEY_B64
 #define CONFIG_ECOWATT_CLOUD_KEY_B64 ""
@@ -36,11 +36,15 @@
 #define CONFIG_ECOWATT_USE_ENVELOPE 1
 #endif
 
+#include <cstdio>   
+#include <cstdlib> 
 #include <cstring>
 #include <string>
 #include <sys/time.h>
 #include <cinttypes>
 #include <inttypes.h>
+#include <algorithm>
+#include <vector>
 
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -83,6 +87,10 @@ static control::RuntimeConfig g_cfg_cur{};
 static control::RuntimeConfig g_cfg_next{};
 static bool g_has_pending_cfg = false;
 
+// NEW (M4): one-shot config_ack to merge into next payload
+static std::string g_cfg_ack_json;
+static bool g_cfg_ack_ready = false;
+
 static control::PendingCommand g_cmd{};
 static control::CommandResult  g_cmd_res{};
 
@@ -111,6 +119,16 @@ extern "C" void fota_progress_notify(uint32_t written, uint32_t total){
   g_fota_progress.has   = true;
   g_fota_progress.written = written;
   g_fota_progress.total   = total;
+}
+
+// Helper: pull last FOTA error string from fota::status_json() for retry hint
+static std::string fota_pull_error_string(){
+  std::string s = fota::status_json();
+  auto k = s.find("\"error\":\"");
+  if (k == std::string::npos) return {};
+  k += 9; auto e = s.find('"', k);
+  if (e == std::string::npos || e <= k) return {};
+  return s.substr(k, e-k);
 }
 
 static void on_wifi(void*, esp_event_base_t base, int32_t id, void*) {
@@ -146,7 +164,6 @@ static void wifi_start_and_wait_ip() {
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
   ESP_ERROR_CHECK(esp_wifi_start());
-  // s_evt = xEventGroupCreate();
   (void)xEventGroupWaitBits(s_evt, BIT_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
 }
 
@@ -168,7 +185,6 @@ static void ntp_start_and_wait_blocking(uint32_t max_wait_ms) {
   EventBits_t bits = xEventGroupWaitBits(s_evt, BIT_NTP_OK, pdFALSE, pdFALSE, pdMS_TO_TICKS(max_wait_ms));
   if ((bits & BIT_NTP_OK) == 0) ESP_LOGW(TAG, "NTP sync timed out; acquisition continues without epoch offset");
 }
-
 
 // ------------------ Tasks ------------------
 static void task_acq(void*){
@@ -201,6 +217,7 @@ static void task_uplink(void*){
   const TickType_t period = pdMS_TO_TICKS(CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC * 1000);
 
   while(true){
+    // Apply pending runtime config (takes effect "after next upload")
     if(g_has_pending_cfg){
       g_cfg_cur = g_cfg_next;
       g_has_pending_cfg = false;
@@ -208,11 +225,13 @@ static void task_uplink(void*){
       nvstore::set_str("cfg","runtime", cfg_json);
     }
 
+    // Snapshot buffer
     std::vector<buffer::Record> batch;
     xSemaphoreTake(g_ring_mtx, portMAX_DELAY);
     batch = g_ring->snapshot_and_clear();
     xSemaphoreGive(g_ring_mtx);
 
+    // Build base payload
     std::string body_json;
     if(!batch.empty()){
       codec::BenchResult br = codec::run_benchmark_delta_rle_v1(batch);
@@ -233,12 +252,12 @@ static void task_uplink(void*){
                   "\"seq\":0,\"codec\":\"none\",\"order\":[],\"block_b64\":\"\"}";
       ESP_LOGI(TAG, "upload: no samples");
     }
+
     // Add FOTA status if present
     if (g_fota_progress.has) {
       uint32_t pct = (g_fota_progress.total>0)
                     ? (uint32_t)((100ULL*g_fota_progress.written)/g_fota_progress.total)
                     : 0;
-      // append: "fota":{"progress":pct,"next_chunk": S.next_chunk }
       char buf[96];
       snprintf(buf, sizeof(buf),
         ",\"fota\":{\"progress\":%lu,\"next_chunk\":%lu}",
@@ -256,7 +275,6 @@ static void task_uplink(void*){
       if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
       g_fota_report.has = false;
     }
-
     // One-shot boot confirmation (set in app_main after cancel_rollback)
     if (g_fota_bootack.has){
       char buf[64];
@@ -265,7 +283,33 @@ static void task_uplink(void*){
       g_fota_bootack.has = false;
     }
 
-    
+    // NEW (M4): append one-shot config_ack if staged
+    if (g_cfg_ack_ready && !g_cfg_ack_json.empty()) {
+      if (body_json.back()=='}') {
+        body_json.pop_back();
+        // Strip braces from g_cfg_ack_json and merge
+        std::string ack = g_cfg_ack_json;
+        if (!ack.empty() && ack.front()=='{') ack.erase(0,1);
+        if (!ack.empty() && ack.back()=='}')  ack.pop_back();
+        body_json += "," + ack + "}";
+      }
+      g_cfg_ack_ready = false;
+      g_cfg_ack_json.clear();
+    }
+
+    // NEW (M4): expose compact FOTA error + next_chunk for retry-friendly server behavior
+    {
+      std::string fe = fota_pull_error_string();
+      if (!fe.empty()) {
+        if (body_json.back()=='}') {
+          char buf[160];
+          snprintf(buf, sizeof(buf), ",\"fota\":{\"error\":\"%s\",\"next_chunk\":%lu}",
+                   fe.c_str(), (unsigned long)fota::get_next_chunk_for_cloud());
+          body_json.pop_back(); body_json += buf; body_json += "}";
+        }
+      }
+    }
+
     // Envelope
     std::string psk = CONFIG_ECOWATT_PSK;
     std::string to_send = body_json;
@@ -274,6 +318,7 @@ static void task_uplink(void*){
       to_send = security::wrap_json_with_hmac(body_json, psk, g_device_nonce);
     }
 
+    // POST
     std::string reply;
     bool ok = uplink::post_payload_and_get_reply(CONFIG_ECOWATT_CLOUD_BASE_URL, CONFIG_ECOWATT_CLOUD_KEY_B64, to_send, reply);
     ESP_LOGI(TAG, "upload POST ok=%d, reply bytes=%u", ok?1:0, (unsigned)reply.size());
@@ -286,106 +331,110 @@ static void task_uplink(void*){
     }
 
     if(!inner.empty()){
-      // config_update
+      // --- CONFIG UPDATE with ACK build ---
       if(inner.find("\"config_update\"") != std::string::npos){
-        uint32_t si_sec = 0; auto p = inner.find("\"sampling_interval\"");
+        uint32_t si_sec = 0; 
+        auto p = inner.find("\"sampling_interval\"");
         if(p!=std::string::npos){ p = inner.find(':', p); if(p!=std::string::npos) si_sec = std::strtoul(inner.c_str()+p+1,nullptr,10); }
-        std::vector<std::string> regs;
+
+        std::vector<std::string> regs_in;
         auto rpos = inner.find("\"registers\"");
         if(rpos!=std::string::npos){
           rpos = inner.find('[', rpos); auto r2 = inner.find(']', rpos);
           if(rpos!=std::string::npos && r2!=std::string::npos && r2>rpos){
             std::string arr = inner.substr(rpos+1, r2-rpos-1);
             size_t i=0; while(true){ auto q1=arr.find('"',i); if(q1==std::string::npos) break;
-              auto q2=arr.find('"',q1+1); if(q2==std::string::npos) break; regs.push_back(arr.substr(q1+1,q2-q1-1)); i=q2+1; }
+              auto q2=arr.find('"',q1+1); if(q2==std::string::npos) break; regs_in.push_back(arr.substr(q1+1,q2-q1-1)); i=q2+1; }
           }
         }
+
         control::RuntimeConfig next = g_cfg_cur;
-        if(si_sec>0) next.sampling_interval_ms = si_sec*1000U;
-        if(!regs.empty()){ std::vector<control::FieldId> f; if(control::map_field_names(regs, f)) next.fields = f; }
-        g_cfg_next = next; g_has_pending_cfg = true;
-        ESP_LOGI(TAG, "queued config: sampling=%" PRIu32 "ms fields=%u", g_cfg_next.sampling_interval_ms, (unsigned)g_cfg_next.fields.size());
+        std::vector<control::FieldId> fids_new;
+        bool regs_valid = regs_in.empty() ? true : control::map_field_names(regs_in, fids_new);
+
+        std::vector<std::string> accepted, rejected, unchanged;
+
+        // sampling_interval decision
+        if (si_sec == 0) {
+          unchanged.push_back("sampling_interval");
+        } else {
+          uint32_t want_ms = si_sec * 1000U;
+          if (want_ms == g_cfg_cur.sampling_interval_ms) unchanged.push_back("sampling_interval");
+          else { next.sampling_interval_ms = want_ms; accepted.push_back("sampling_interval"); }
+        }
+
+        // registers decision
+        if (regs_in.empty()) {
+          unchanged.push_back("registers");
+        } else if (!regs_valid) {
+          rejected.push_back("registers");
+        } else {
+          std::vector<int> cur_ids; for (auto f : g_cfg_cur.fields) cur_ids.push_back((int)f);
+          std::vector<int> new_ids; for (auto f : fids_new)        new_ids.push_back((int)f);
+          std::sort(cur_ids.begin(),cur_ids.end());
+          std::sort(new_ids.begin(),new_ids.end());
+          if (cur_ids == new_ids) unchanged.push_back("registers");
+          else { next.fields = fids_new; accepted.push_back("registers"); }
+        }
+
+        // apply-at-next-slot
+        g_cfg_next = next; 
+        g_has_pending_cfg = true;
+
+        // stage config_ack for next payload
+        auto join = [](const std::vector<std::string>& v) {
+          std::string s="["; for (size_t i=0;i<v.size();++i){ s+="\""+v[i]+"\""; if(i+1<v.size()) s+=","; } s+="]"; return s;
+        };
+        g_cfg_ack_json = std::string("{\"config_ack\":{\"accepted\":") + join(accepted)
+                       + ",\"rejected\":"  + join(rejected)
+                       + ",\"unchanged\":" + join(unchanged) + "}}";
+        g_cfg_ack_ready = true;
+
+        ESP_LOGI(TAG, "queued config: sampling=%" PRIu32 "ms fields=%u (ack prepared)",
+                 g_cfg_next.sampling_interval_ms, (unsigned)g_cfg_next.fields.size());
       }
+
       // command
       if(inner.find("\"command\"") != std::string::npos){
         auto vpos = inner.find("\"value\""); int val=-1;
         if(vpos!=std::string::npos){ vpos = inner.find(':', vpos); if(vpos!=std::string::npos) val = std::strtol(inner.c_str()+vpos+1, nullptr, 10); }
         if(val>=0){ g_cmd.has_cmd = true; g_cmd.export_pct = val; g_cmd.received_at_ms = now_ms_epoch(); }
       }
-      // // FOTA
-      // if(inner.find("\"fota\"") != std::string::npos){
-      //   auto mpos = inner.find("\"manifest\"");
-      //   if(mpos!=std::string::npos){
-      //     fota::Manifest mf{};
-      //     auto v = inner.find("\"version\"", mpos); if(v!=std::string::npos){ v = inner.find('"', v+9); auto e=inner.find('"', v+1); mf.version = inner.substr(v+1, e-v-1); }
-      //     auto s = inner.find("\"size\"", mpos);    if(s!=std::string::npos){ s = inner.find(':', s); mf.size = std::strtoul(inner.c_str()+s+1,nullptr,10); }
-      //     auto h = inner.find("\"hash\"", mpos);    if(h!=std::string::npos){ h = inner.find('"', h+6); auto e=inner.find('"', h+1); mf.hash_hex = inner.substr(h+1, e-h-1); }
-      //     auto cs= inner.find("\"chunk_size\"", mpos); if(cs!=std::string::npos){ cs = inner.find(':', cs); mf.chunk_size = std::strtoul(inner.c_str()+cs+1,nullptr,10); }
-      //     fota::start(mf);
-      //   }
-      //   // auto cpos = inner.find("\"chunk_number\"");
-      //   // if(cpos!=std::string::npos){
-      //   //   cpos = inner.find(':', cpos); uint32_t num = std::strtoul(inner.c_str()+cpos+1,nullptr,10);
-      //   //   auto d = inner.find("\"data\""); std::string data;
-      //   //   if(d!=std::string::npos){ d = inner.find('"', d+6); auto e=inner.find('"', d+1); data = inner.substr(d+1, e-d-1); }
-      //   //   if(!data.empty()) fota::ingest_chunk(num, data);
-      //   // }
-      //   // NEW (anchor the search inside the fota object and after cpos)
-      //   auto fpos = inner.find("\"fota\"");
-      //   if (fpos != std::string::npos) {
-      //     auto cpos = inner.find("\"chunk_number\"", fpos);
-      //     if (cpos != std::string::npos) {
-      //       auto colon = inner.find(':', cpos);
-      //       uint32_t num = std::strtoul(inner.c_str()+colon+1, nullptr, 10);
 
-      //       auto d = inner.find("\"data\"", cpos);   // <-- key line: search AFTER chunk_number
-      //       if (d != std::string::npos) {
-      //         d = inner.find('"', d + 6);
-      //         auto e = inner.find('"', d + 1);
-      //         std::string data = inner.substr(d + 1, e - d - 1);
-      //         if(!data.empty()) fota::ingest_chunk(num, data);
-      //       }
-      //     }
-      //   }
-      // }
+      // FOTA (manifest + chunk)
+      {
+        auto fpos = inner.find("\"fota\"");
+        if (fpos != std::string::npos) {
+          auto mpos = inner.find("\"manifest\"", fpos);
+          if (mpos != std::string::npos) {
+            fota::Manifest mf{};
+            auto v  = inner.find("\"version\"",    mpos);
+            auto sz = inner.find("\"size\"",       mpos);
+            auto hh = inner.find("\"hash\"",       mpos);
+            auto cs = inner.find("\"chunk_size\"", mpos);
 
-    // FOTA
-    {
-      auto fpos = inner.find("\"fota\"");
-      if (fpos != std::string::npos) {
+            if (v  != std::string::npos) { auto q1 = inner.find('"', v+9);  auto q2 = inner.find('"', q1+1);  mf.version   = inner.substr(q1+1, q2-q1-1); }
+            if (sz != std::string::npos) { auto c  = inner.find(':', sz);   mf.size       = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
+            if (hh != std::string::npos) { auto q1 = inner.find('"', hh+6); auto q2 = inner.find('"', q1+1);  mf.hash_hex   = inner.substr(q1+1, q2-q1-1); }
+            if (cs != std::string::npos) { auto c  = inner.find(':', cs);   mf.chunk_size = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
 
-        // Parse manifest if present
-        auto mpos = inner.find("\"manifest\"", fpos);
-        if (mpos != std::string::npos) {
-          fota::Manifest mf{};
-          auto v  = inner.find("\"version\"",    mpos);
-          auto sz = inner.find("\"size\"",       mpos);
-          auto hh = inner.find("\"hash\"",       mpos);
-          auto cs = inner.find("\"chunk_size\"", mpos);
+            fota::start(mf);
+          }
 
-          if (v  != std::string::npos) { auto q1 = inner.find('"', v+9);  auto q2 = inner.find('"', q1+1);  mf.version   = inner.substr(q1+1, q2-q1-1); }
-          if (sz != std::string::npos) { auto c  = inner.find(':', sz);   mf.size       = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
-          if (hh != std::string::npos) { auto q1 = inner.find('"', hh+6); auto q2 = inner.find('"', q1+1);  mf.hash_hex   = inner.substr(q1+1, q2-q1-1); }
-          if (cs != std::string::npos) { auto c  = inner.find(':', cs);   mf.chunk_size = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
+          auto cpos = inner.find("\"chunk_number\"", fpos);
+          if (cpos != std::string::npos) {
+            auto colon = inner.find(':', cpos);
+            uint32_t num = std::strtoul(inner.c_str()+colon+1, nullptr, 10);
 
-          fota::start(mf);
-        }
-
-        // Parse and ingest chunk if present
-        auto cpos = inner.find("\"chunk_number\"", fpos);
-        if (cpos != std::string::npos) {
-          auto colon = inner.find(':', cpos);
-          uint32_t num = std::strtoul(inner.c_str()+colon+1, nullptr, 10);
-
-          // IMPORTANT: search for "data" AFTER the chunk_number occurrence
-          auto d = inner.find("\"data\"", cpos);
-          if (d != std::string::npos) {
-            d = inner.find('"', d + 6);
-            auto e = inner.find('"', d + 1);
-            if (d != std::string::npos && e != std::string::npos && e > d) {
-              std::string data = inner.substr(d + 1, e - d - 1);
-              if (!data.empty()) {
-                fota::ingest_chunk(num, data);
+            auto d = inner.find("\"data\"", cpos);
+            if (d != std::string::npos) {
+              d = inner.find('"', d + 6);
+              auto e = inner.find('"', d + 1);
+              if (d != std::string::npos && e != std::string::npos && e > d) {
+                std::string data = inner.substr(d + 1, e - d - 1);
+                if (!data.empty()) {
+                  fota::ingest_chunk(num, data);
+                }
               }
             }
           }
@@ -393,14 +442,7 @@ static void task_uplink(void*){
       }
     }
 
-    }
-    
-    // // After FOTA manifest/chunk handling in task_uplink()
-    //   bool ok_verify=false, ok_apply=false;
-    //   if (fota::finalize_and_apply(ok_verify, ok_apply)) {
-    //     ESP_LOGI(TAG, "FOTA finalize: verify=%d apply(reboot)=%d", ok_verify?1:0, ok_apply?1:0);
-    //   }
-    // After FOTA manifest/chunk handling in task_uplink()
+    // FOTA finalize (verify + apply)
     bool ok_verify=false, ok_apply=false;
     if (fota::finalize_and_apply(ok_verify, ok_apply)) {
       // Defer reporting to the next payload
