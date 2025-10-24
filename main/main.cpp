@@ -15,7 +15,7 @@
 #define CONFIG_ECOWATT_API_KEY_B64 ""
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_BASE_URL
-#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.150.146:5000"
+#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.59.159:5000"
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_KEY_B64
 #define CONFIG_ECOWATT_CLOUD_KEY_B64 ""
@@ -35,7 +35,38 @@
 #ifndef CONFIG_ECOWATT_USE_ENVELOPE
 #define CONFIG_ECOWATT_USE_ENVELOPE 1
 #endif
+#ifndef CONFIG_ECOWATT_PM_MIN_FREQ_MHZ
+#define CONFIG_ECOWATT_PM_MIN_FREQ_MHZ 40
+#endif
+#ifndef CONFIG_ECOWATT_PM_MAX_FREQ_MHZ
+#define CONFIG_ECOWATT_PM_MAX_FREQ_MHZ 160
+#endif
+#ifndef CONFIG_ECOWATT_WIFI_LISTEN_INTERVAL
+#define CONFIG_ECOWATT_WIFI_LISTEN_INTERVAL 10
+#endif
+#ifndef CONFIG_ECOWATT_WIFI_PS_MODE
+// 1 = MIN_MODEM (default, saves power), 0 = NONE (max throughput)
+#define CONFIG_ECOWATT_WIFI_PS_MODE 1
+#endif
 
+#ifndef CONFIG_ECOWATT_WIFI_GATE_BETWEEN_UPLOADS
+// 0 = keep Wi-Fi associated between uploads (default), 1 = stop/start
+#define CONFIG_ECOWATT_WIFI_GATE_BETWEEN_UPLOADS 0
+#endif
+
+#ifndef CONFIG_ECOWATT_SLEEP_MARGIN_MS
+// guard time before deadline so we don't oversleep
+#define CONFIG_ECOWATT_SLEEP_MARGIN_MS 30
+#endif
+
+#ifndef CONFIG_ECOWATT_PS_BURST_TOGGLE
+#define CONFIG_ECOWATT_PS_BURST_TOGGLE 0   // keep 0 to avoid AP hiccups
+#endif
+#ifndef CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP
+#define CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP 0
+#endif
+
+// =========================================================
 #include <cstdio>   
 #include <cstdlib> 
 #include <cstring>
@@ -53,6 +84,8 @@
 #include "esp_netif.h"
 #include "esp_timer.h"
 #include "esp_sntp.h"
+#include "esp_pm.h"
+#include "esp_sleep.h"
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -97,6 +130,10 @@ static control::CommandResult  g_cmd_res{};
 static uint64_t g_device_nonce = 0;
 static uint64_t g_last_cloud_nonce = 0;
 
+static esp_pm_lock_handle_t s_pm_lock = nullptr;
+
+static uint64_t g_idle_budget_ms = 0;
+
 static acquisition::Acquisition* g_acq = nullptr;
 struct {
   bool has = false;
@@ -113,6 +150,27 @@ struct {
 struct {
   bool has = false;   // set once on first successful boot after OTA
 } g_fota_bootack;
+
+// --- Power instrumentation ---
+struct power_stats_t {
+  uint64_t t_sleep_ms  = 0;
+  uint64_t t_uplink_ms = 0;
+  uint32_t uplink_bytes = 0;
+} g_pwr;
+
+
+
+static inline uint64_t now_ms() { return (uint64_t)esp_timer_get_time()/1000ULL; }
+
+static void eco_light_sleep_until(uint64_t wake_at_ms) {
+  uint64_t now = now_ms();
+  if (wake_at_ms <= now + CONFIG_ECOWATT_SLEEP_MARGIN_MS) return;
+  uint64_t delta_ms = wake_at_ms - now - CONFIG_ECOWATT_SLEEP_MARGIN_MS;
+  esp_sleep_enable_timer_wakeup(delta_ms * 1000ULL);
+  uint64_t t0 = now_ms();
+  esp_light_sleep_start();
+  g_pwr.t_sleep_ms += (now_ms() - t0);
+}
 
 // Called by fota.cpp after each accepted chunk
 extern "C" void fota_progress_notify(uint32_t written, uint32_t total){
@@ -163,7 +221,16 @@ static void wifi_start_and_wait_ip() {
   sta.sta.threshold.authmode = WIFI_AUTH_WPA2_PSK;
   ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
   ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+  
+  sta.sta.listen_interval = CONFIG_ECOWATT_WIFI_LISTEN_INTERVAL; // helps AP buffer beacons
+  ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &sta));
+  #if CONFIG_ECOWATT_WIFI_PS_MODE == 1
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_MIN_MODEM));  // sip power when idle
+  #else
+    ESP_ERROR_CHECK(esp_wifi_set_ps(WIFI_PS_NONE));       // max throughput baseline
+  #endif
   ESP_ERROR_CHECK(esp_wifi_start());
+
   (void)xEventGroupWaitBits(s_evt, BIT_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
 }
 
@@ -183,7 +250,12 @@ static void ntp_start_and_wait_blocking(uint32_t max_wait_ms) {
   esp_sntp_set_time_sync_notification_cb(sntp_sync_cb);
   esp_sntp_init();
   EventBits_t bits = xEventGroupWaitBits(s_evt, BIT_NTP_OK, pdFALSE, pdFALSE, pdMS_TO_TICKS(max_wait_ms));
-  if ((bits & BIT_NTP_OK) == 0) ESP_LOGW(TAG, "NTP sync timed out; acquisition continues without epoch offset");
+  if (bits & BIT_NTP_OK) {
+    esp_sntp_stop();   // gate SNTP after first successful sync
+  } else {
+    ESP_LOGW(TAG, "NTP sync timed out; acquisition continues without epoch offset");
+  }
+  // if ((bits & BIT_NTP_OK) == 0) ESP_LOGW(TAG, "NTP sync timed out; acquisition continues without epoch offset");
 }
 
 // ------------------ Tasks ------------------
@@ -195,21 +267,36 @@ static void task_acq(void*){
   uint32_t period_ms = g_cfg_cur.sampling_interval_ms;
   TickType_t period_ticks = pdMS_TO_TICKS(period_ms);
 
-  while(true){
+  while (true) {
+    uint64_t loop_start_ms = now_ms();
+
     acquisition::Sample s{};
-    std::vector<int> fids; for(auto f: g_cfg_cur.fields) fids.push_back((int)f);
-    if(!fids.empty()) g_acq->read_selected(fids, s); else g_acq->read_all(s);
+    std::vector<int> fids; for (auto f: g_cfg_cur.fields) fids.push_back((int)f);
+    if (!fids.empty()) g_acq->read_selected(fids, s); else g_acq->read_all(s);
 
     buffer::Record rec{ now_ms_epoch(), s };
     xSemaphoreTake(g_ring_mtx, portMAX_DELAY); g_ring->push(rec); xSemaphoreGive(g_ring_mtx);
 
     ESP_LOGI(TAG, "ACQ tick @ %" PRIu64 " ms (epoch)", rec.epoch_ms);
+
+    // (optional) manual sleep is OFF for now, so this block is skipped
+  #if CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP
+    uint64_t next_tick_ms = loop_start_ms + (uint64_t)period_ms;
+    eco_light_sleep_until(next_tick_ms);
+  #endif
+
+  // Idle budget = how much of this period we didn't use
+  uint64_t work_ms = now_ms() - loop_start_ms;
+  if (work_ms < period_ms) g_idle_budget_ms += (period_ms - work_ms);
+
     vTaskDelayUntil(&last, period_ticks);
-    if(period_ms != g_cfg_cur.sampling_interval_ms){
-      period_ms   = g_cfg_cur.sampling_interval_ms;
-      period_ticks= pdMS_TO_TICKS(period_ms);
+
+    if (period_ms != g_cfg_cur.sampling_interval_ms) {
+      period_ms    = g_cfg_cur.sampling_interval_ms;
+      period_ticks = pdMS_TO_TICKS(period_ms);
     }
   }
+
 }
 
 static void task_uplink(void*){
@@ -309,18 +396,69 @@ static void task_uplink(void*){
         }
       }
     }
+    // Append power stats (rolling) into the payload root
+    {
+      if (body_json.back()=='}') {
+        char buf[192];
+        snprintf(buf, sizeof(buf),
+          ",\"power_stats\":{"
+            "\"idle_budget_ms\":%" PRIu64 ","
+            "\"t_sleep_ms\":%" PRIu64 ","
+            "\"t_uplink_ms\":%" PRIu64 ","
+            "\"uplink_bytes\":%u"
+          "}",
+          (unsigned long long)g_idle_budget_ms,
+          (unsigned long long)g_pwr.t_sleep_ms,
+          (unsigned long long)g_pwr.t_uplink_ms,
+          (unsigned)g_pwr.uplink_bytes);
+        body_json.pop_back(); body_json += buf; body_json += "}";
+        g_pwr = power_stats_t{};          // reset rolling counters
+        g_idle_budget_ms = 0;             // reset idle budget
+      }
+    }
+
 
     // Envelope
     std::string psk = CONFIG_ECOWATT_PSK;
     std::string to_send = body_json;
     if (CONFIG_ECOWATT_USE_ENVELOPE) {
-      ++g_device_nonce; nvstore::set_u64("sec","nonce_device", g_device_nonce);
+      ++g_device_nonce;
+      nvstore::set_u64("sec","nonce_device", g_device_nonce);
       to_send = security::wrap_json_with_hmac(body_json, psk, g_device_nonce);
     }
 
-    // POST
+    // POST (keep CPU at max during network burst)
+    if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);   // <-- acquire AFTER to_send is ready
+
+    // Temporarily disable Wi-Fi PS for throughput
+    // #if CONFIG_ECOWATT_WIFI_PS_MODE == 1
+    //   esp_wifi_set_ps(WIFI_PS_NONE);esp_wifi_start()
+    // #endif
+    #if CONFIG_ECOWATT_PS_BURST_TOGGLE
+      esp_wifi_set_ps(WIFI_PS_NONE);   // BEFORE POST
+    #endif
+    uint64_t t0 = now_ms();
     std::string reply;
-    bool ok = uplink::post_payload_and_get_reply(CONFIG_ECOWATT_CLOUD_BASE_URL, CONFIG_ECOWATT_CLOUD_KEY_B64, to_send, reply);
+    bool ok = uplink::post_payload_and_get_reply(
+                CONFIG_ECOWATT_CLOUD_BASE_URL,
+                CONFIG_ECOWATT_CLOUD_KEY_B64,
+                to_send,
+                reply);
+    g_pwr.t_uplink_ms += (now_ms() - t0);
+    g_pwr.uplink_bytes += (uint32_t)to_send.size();
+    ESP_LOGI(TAG, "[PWR-DBG] idle=%" PRIu64 " sleep=%" PRIu64 " uplink=%" PRIu64 " bytes=%u",
+         g_idle_budget_ms, g_pwr.t_sleep_ms, g_pwr.t_uplink_ms, (unsigned)g_pwr.uplink_bytes);
+
+    // // Restore idle PS mode right after the burst
+    // #if CONFIG_ECOWATT_WIFI_PS_MODE == 1
+    //   esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+    // #endif
+    #if CONFIG_ECOWATT_PS_BURST_TOGGLE
+      esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // AFTER POST
+    #endif
+
+    if (s_pm_lock) esp_pm_lock_release(s_pm_lock);   // release immediately after POST
+
     ESP_LOGI(TAG, "upload POST ok=%d, reply bytes=%u", ok?1:0, (unsigned)reply.size());
 
     std::string inner = reply;
@@ -482,6 +620,16 @@ extern "C" void app_main(void) {
     g_fota_bootack.has = true;
   }
   ESP_ERROR_CHECK(nvs_flash_init());
+  ESP_ERROR_CHECK(esp_pm_lock_create(ESP_PM_CPU_FREQ_MAX, 0, "uplink", &s_pm_lock));
+
+  esp_pm_config_t pmcfg = {
+    .max_freq_mhz = CONFIG_ECOWATT_PM_MAX_FREQ_MHZ,
+    .min_freq_mhz = CONFIG_ECOWATT_PM_MIN_FREQ_MHZ,
+    .light_sleep_enable = false
+  };
+  ESP_ERROR_CHECK(esp_pm_configure(&pmcfg));
+
+
   wifi_start_and_wait_ip();
   ntp_start_and_wait_blocking(60000);
 

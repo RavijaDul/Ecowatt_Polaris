@@ -1,4 +1,4 @@
-# server.py
+# app.py
 import os, time, base64, json, sqlite3, pathlib, datetime, glob, hmac
 from typing import List, Tuple, Optional
 from flask import Flask, request, jsonify, g, Response
@@ -48,6 +48,18 @@ CREATE TABLE IF NOT EXISTS fota_progress(
   percent INTEGER,
   updated TEXT DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE TABLE IF NOT EXISTS power_stats (
+  id            INTEGER PRIMARY KEY AUTOINCREMENT,
+  device        TEXT    NOT NULL,
+  received_at   INTEGER NOT NULL,
+  t_sleep_ms    INTEGER NOT NULL,
+  idle_budget_ms INTEGER NOT NULL,
+  t_uplink_ms   INTEGER NOT NULL,
+  uplink_bytes  INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_power_stats_dev_time ON power_stats(device, received_at);
+
 """
 
 
@@ -255,6 +267,8 @@ def index():
         <ul>
             <li><a href="/admin">Uploads</a> — browse recent uploads and drill into details</li>
             <li><a href="/admin/fota">FOTA</a> — device progress & event history</li>
+            <li><a href="/admin/power">Power</a> — sleep/uplink timing stats per device</li>
+
         </ul>
         
     </body>
@@ -334,6 +348,25 @@ def device_upload():
     ts_list = body.get("ts_list")
     now_ms = int(time.time() * 1000)
 
+    # --- Power stats (optional, device-added) ---
+    ps = body.get("power_stats")
+    if isinstance(ps, dict):
+        try:
+            t_sleep  = int(ps.get("t_sleep_ms") or 0)          # will be 0 with our approach
+            t_uplink = int(ps.get("t_uplink_ms") or 0)
+            ubytes   = int(ps.get("uplink_bytes") or 0)
+            idle_b   = int(ps.get("idle_budget_ms") or 0)
+            db = get_db()
+            db.execute(
+                "INSERT INTO power_stats(device, received_at, t_sleep_ms, t_uplink_ms, uplink_bytes, idle_budget_ms) VALUES(?,?,?,?,?,?)",
+                (dev, now_ms, t_sleep, t_uplink, ubytes, idle_b)
+            )
+            db.commit()
+            print(f"[PWR] dev={dev} idle={idle_b}ms uplink={t_uplink}ms bytes={ubytes}", flush=True)
+        except Exception as e:
+            print(f"[PWR] insert error: {e}", flush=True)
+
+    # --------- Store upload ---------
     db = get_db()
     cur = db.cursor()
     cur.execute("""INSERT INTO uploads
@@ -667,6 +700,116 @@ def api_fota_events_device(device: str):
         {"ts":r[0], "device":r[1], "kind":r[2], "detail":r[3]}
         for r in rows
     ])
+
+@app.get("/admin/power")
+def admin_power():
+    db = get_db()
+    # Summary by device (recent averages)
+    summary = db.execute("""
+       SELECT device,
+            COUNT(*)                    AS n,
+            ROUND(AVG(idle_budget_ms),1) AS avg_idle_ms,
+            ROUND(AVG(t_sleep_ms), 1)     AS avg_sleep_ms,
+            ROUND(AVG(t_uplink_ms), 1)    AS avg_uplink_ms,
+            ROUND(AVG(uplink_bytes), 1)   AS avg_bytes,
+            MAX(received_at)              AS last_recv
+        FROM power_stats
+        GROUP BY device
+        ORDER BY last_recv DESC
+
+    """).fetchall()
+
+    # Recent raw rows (last 200)
+    recent = db.execute("""
+        SELECT device, received_at,idle_budget_ms, t_sleep_ms, t_uplink_ms, uplink_bytes
+        FROM power_stats
+        ORDER BY received_at DESC
+        LIMIT 200
+    """).fetchall()
+
+    out = [HTML_HEAD, "<h2>Power – Summary by Device</h2>"]
+    out.append(
+        "<table class='table'><tr>"
+        "<th>Device</th><th>Samples</th><th>Avg Idle (ms)</th>"
+        "<th>Avg Sleep (ms)</th><th>Avg Uplink (ms)</th><th>Avg Bytes</th><th>Last Received</th>"
+        "</tr>"
+    )
+
+    for dev, n, avg_idle,avg_sl, avg_ul, avg_b, last_ms in summary:
+        last_h = datetime.datetime.fromtimestamp(last_ms/1000.0).strftime("%Y-%m-%d %H:%M:%S") if last_ms else "-"
+        out.append(f"<tr><td><a href='/admin/power/{dev}'>{dev}</a></td>"
+               f"<td>{n}</td><td>{avg_idle}</td><td>{avg_sl}</td><td>{avg_ul}</td><td>{avg_b}</td><td>{last_h}</td></tr>")
+    out.append("</table>")
+
+    out.append("<h2>Recent Entries</h2>")
+    out.append("<table class='table'><tr><th>Time</th><th>Device</th><th>Idle (ms)</th><th>Sleep (ms)</th><th>Uplink (ms)</th><th>Bytes</th></tr>")
+    for dev, rcv, idle, sl, ul, b in recent:
+        rcv_h = datetime.datetime.fromtimestamp(rcv/1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        out.append(f"<tr><td>{rcv_h}</td><td>{dev}</td><td>{idle}</td><td>{sl}</td><td>{ul}</td><td>{b}</td></tr>")
+    out.append("</table>" + HTML_TAIL)
+    return Response("".join(out), mimetype="text/html")
+
+@app.get("/admin/power/<device>")
+def admin_power_device(device: str):
+    db = get_db()
+    rows = db.execute("""
+        SELECT received_at,idle_budget_ms,  t_sleep_ms, t_uplink_ms, uplink_bytes
+        FROM power_stats
+        WHERE device=?
+        ORDER BY received_at DESC
+        LIMIT 500
+    """, (device,)).fetchall()
+
+    out = [HTML_HEAD, f"<h2>Power – {device}</h2>"]
+    out.append("<table class='table'><tr><th>Time</th><th>Idle (ms)</th><th>Sleep (ms)</th><th>Uplink (ms)</th><th>Bytes</th></tr>")
+    # rows:
+    for rcv, idle, sl, ul, b in rows:
+        rcv_h = datetime.datetime.fromtimestamp(rcv/1000.0).strftime("%Y-%m-%d %H:%M:%S")
+        out.append(f"<tr><td>{rcv_h}</td><td>{idle}</td><td>{sl}</td><td>{ul}</td><td>{b}</td></tr>")
+    out.append("</table>" + HTML_TAIL)
+    return Response("".join(out), mimetype="text/html")
+
+@app.get("/api/power/summary")
+def api_power_summary():
+    db = get_db()
+    rows = db.execute("""
+        SELECT device,
+            COUNT(*)               AS n,
+            AVG(idle_budget_ms)    AS avg_idle_ms,
+            AVG(t_sleep_ms)        AS avg_sleep_ms,
+            AVG(t_uplink_ms)       AS avg_uplink_ms,
+            AVG(uplink_bytes)      AS avg_bytes,
+            MAX(received_at)       AS last_recv
+        FROM power_stats
+        GROUP BY device
+        ORDER BY last_recv DESC
+    """).fetchall()
+
+    return jsonify([
+        {"device": r[0], "samples": r[1], "avg_idle_ms": r[2],
+        "avg_sleep_ms": r[3], "avg_uplink_ms": r[4],
+        "avg_bytes": r[5], "last_received_ms": r[6]}
+        for r in rows
+    ])
+
+@app.get("/api/power/<device>")
+def api_power_device(device: str):
+    db = get_db()
+    rows = db.execute("""
+        SELECT received_at, idle_budget_ms, t_sleep_ms, t_uplink_ms, uplink_bytes
+        FROM power_stats
+        WHERE device=?
+        ORDER BY received_at DESC
+        LIMIT 1000
+    """, (device,)).fetchall()
+
+    return jsonify([
+        {"received_at_ms": r[0], "idle_budget_ms": r[1],
+        "t_sleep_ms": r[2], "t_uplink_ms": r[3], "uplink_bytes": r[4]}
+        for r in rows
+    ])
+
+
 
 if __name__ == "__main__":
     from waitress import serve
