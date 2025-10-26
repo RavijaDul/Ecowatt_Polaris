@@ -1,7 +1,8 @@
 # app.py
 import os, time, base64, json, sqlite3, pathlib, datetime, glob, hmac
 from typing import List, Tuple, Optional
-from flask import Flask, request, jsonify, g, Response
+from flask import Flask, request, jsonify, g, Response, redirect, url_for
+import requests
 
 
 # ---- Config via env ----
@@ -60,8 +61,15 @@ CREATE TABLE IF NOT EXISTS power_stats (
 );
 CREATE INDEX IF NOT EXISTS idx_power_stats_dev_time ON power_stats(device, received_at);
 
-"""
+CREATE TABLE IF NOT EXISTS device_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device      TEXT NOT NULL,
+  received_at INTEGER NOT NULL,
+  event       TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_dev_events ON device_events(device, received_at);
 
+"""
 
 app = Flask(__name__)
 
@@ -268,6 +276,8 @@ def index():
             <li><a href="/admin">Uploads</a> — browse recent uploads and drill into details</li>
             <li><a href="/admin/fota">FOTA</a> — device progress & event history</li>
             <li><a href="/admin/power">Power</a> — sleep/uplink timing stats per device</li>
+            <li><a href="/admin/controls">Controls</a> — configurations and command execution</li>
+            <li><a href="/admin/sim-fault">SIM Fault</a> — hits the Inverter SIM API</li>
 
         </ul>
         
@@ -347,6 +357,18 @@ def device_upload():
     order = list(body["order"])
     ts_list = body.get("ts_list")
     now_ms = int(time.time() * 1000)
+    # ---- Device events (optional, best-effort) ----
+    evs = body.get("events")
+    if isinstance(evs, list) and evs:
+        try:
+            db = get_db()
+            db.executemany(
+                "INSERT INTO device_events(device, received_at, event) VALUES(?,?,?)",
+                [(dev, now_ms, str(e)) for e in evs]
+            )
+            db.commit()
+        except Exception as e:
+            print(f"[EVT] insert error: {e}", flush=True)
 
     # --- Power stats (optional, device-added) ---
     ps = body.get("power_stats")
@@ -614,7 +636,6 @@ def admin_fota():
     out.append("</table>" + HTML_TAIL)
     return Response("".join(out), mimetype="text/html")
 
-
 @app.get("/admin/fota/<device>")
 def admin_fota_device(device: str):
     db = get_db()
@@ -809,7 +830,162 @@ def api_power_device(device: str):
         for r in rows
     ])
 
+@app.get("/admin/events")
+def admin_events():
+    rows = get_db().execute("""
+      SELECT strftime('%Y-%m-%d %H:%M:%S', received_at/1000,'unixepoch'),
+             device, event
+      FROM device_events
+      ORDER BY received_at DESC
+      LIMIT 300
+    """).fetchall()
+    out=[HTML_HEAD, "<h2>Recent Device Events</h2>",
+         "<table class='table'><tr><th>Time</th><th>Device</th><th>Event</th></tr>"]
+    for t, d, e in rows:
+        out.append(f"<tr><td>{t}</td><td><a href='/admin/events/{d}'>{d}</a></td><td class='mono'>{e}</td></tr>")
+    out.append("</table>"+HTML_TAIL)
+    return Response("".join(out), mimetype="text/html")
 
+@app.get("/admin/events/<device>")
+def admin_events_device(device: str):
+    rows = get_db().execute("""
+      SELECT strftime('%Y-%m-%d %H:%M:%S', received_at/1000,'unixepoch'),
+             event
+      FROM device_events
+      WHERE device=?
+      ORDER BY received_at DESC
+      LIMIT 1000
+    """, (device,)).fetchall()
+    out=[HTML_HEAD, f"<h2>Events – {device}</h2>",
+         "<table class='table'><tr><th>Time</th><th>Event</th></tr>"]
+    for t, e in rows:
+        out.append(f"<tr><td>{t}</td><td class='mono'>{e}</td></tr>")
+    out.append("</table>"+HTML_TAIL)
+    return Response("".join(out), mimetype="text/html")
+
+@app.route("/admin/controls", methods=["GET","POST"])
+def admin_controls():
+    pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    msg = ""
+    if request.method == "POST":
+        kind = request.form.get("kind")
+        if kind == "config":
+            si  = int(request.form.get("sampling_interval") or 0)
+            regs = [r.strip() for r in (request.form.get("registers") or "").split(",") if r.strip()]
+            obj = {"config_update": {"sampling_interval": si, "registers": regs}}
+            open(os.path.join(LOG_DIR, "config_update.json"), "w").write(json.dumps(obj))
+            msg = "queued config_update"
+        elif kind == "command":
+            val = int(request.form.get("export_percent") or 0)
+            obj = {"command":{"action":"write_register","target_register":"status_flag","value":val}}
+            open(os.path.join(LOG_DIR, "command.json"), "w").write(json.dumps(obj))
+            msg = "queued command"
+
+        return redirect(url_for("admin_controls") + f"?ok={msg}")
+
+    ok = request.args.get("ok","")
+    html = f"""{HTML_HEAD}
+    <h2>Controls</h2>
+    <p class='small'>These are <b>one-shot</b>; the next device upload will pick them up.</p>
+    {"<p><b>"+ok+"</b></p>" if ok else ""}
+
+    <h3>Config update</h3>
+    <form method="post">
+      <input type="hidden" name="kind" value="config">
+      <label>Sampling interval (sec): <input name="sampling_interval" type="number" min="1" value="5"></label><br>
+      <label>Registers (comma): <input name="registers" type="text" placeholder="vac1,iac1,fac1"></label><br>
+      <button type="submit">Queue config_update</button>
+    </form>
+
+    <h3>Command (export power %)</h3>
+    <form method="post">
+      <input type="hidden" name="kind" value="command">
+      <label>Export %: <input name="export_percent" type="number" min="0" max="100" value="25"></label><br>
+      <button type="submit">Queue command</button>
+    </form>
+    {HTML_TAIL}"""
+    return Response(html, mimetype="text/html")
+
+@app.route("/admin/sim-fault", methods=["GET","POST"])
+def admin_sim_fault():
+    base = os.getenv("SIM_BASE", "http://20.15.114.131:8080").rstrip("/")
+    key  = os.getenv("SIM_KEY_B64", "")  # must match what the device uses
+    note = ""
+    detail = ""
+
+    def _post_json(path, payload):
+        url = f"{base}{path}"
+        try:
+            r = requests.post(
+                url,
+                headers={"Authorization": key, "Content-Type": "application/json"},
+                json=payload,
+                timeout=6,
+            )
+            return r.status_code, (r.text or "").strip()
+        except Exception as e:
+            return None, f"Exception: {e}"
+
+    def _get(path):
+        url = f"{base}{path}"
+        try:
+            r = requests.get(url, headers={"Authorization": key}, timeout=4)
+            return r.status_code, (r.text or "").strip()
+        except Exception as e:
+            return None, f"Exception: {e}"
+
+    if request.method == "POST":
+        action = request.form.get("action", "trigger")
+        if action == "ping":
+            code, body = _get("/api/health")
+            note = f"Ping → {code}"
+            detail = body
+        else:
+            payload = {
+                "errorType": request.form.get("type", "EXCEPTION").strip(),
+                "exceptionCode": int(request.form.get("code") or 0),
+                "delayMs": int(request.form.get("delay") or 0),
+            }
+            code, body = _post_json("/api/user/error-flag/add", payload)
+            note = f"Sent → {code}"
+            detail = body
+
+    warn = []
+    if not key:
+        warn.append("SIM_KEY_B64 is empty (calls will likely be unauthorized).")
+    if not base.startswith("http"):
+        warn.append("SIM_BASE looks invalid; set a full http(s) URL.")
+
+    html = f"""{HTML_HEAD}
+    <h2>SIM Fault Injection</h2>
+    <p class='small'>Sets a one-shot fault on the supervisor's SIM API; the next device SIM read should see it.</p>
+    {"".join(f"<p style='color:#b00'><b>⚠ {w}</b></p>" for w in warn)}
+    {"<p><b>"+note+"</b></p><pre class='mono'>"+detail+"</pre>" if note else ""}
+
+    <form method="post" style="margin-bottom:18px">
+      <input type="hidden" name="action" value="trigger">
+      <label>Type:
+        <select name="type">
+          <option>EXCEPTION</option>
+          <option>CRC_ERROR</option>
+          <option>CORRUPT</option>
+          <option>PACKET_DROP</option>
+          <option>DELAY</option>
+        </select>
+      </label>
+      <label>Exception code: <input name="code" type="number" min="0" value="2"></label>
+      <label>Delay (ms): <input name="delay" type="number" min="0" value="8000"></label>
+      <button type="submit">Trigger</button>
+    </form>
+
+    <form method="post">
+      <input type="hidden" name="action" value="ping">
+      <button type="submit">Ping SIM /api/health</button>
+    </form>
+
+    <p class='small'>Using SIM_BASE=<code>{base}</code></p>
+    {HTML_TAIL}"""
+    return Response(html, mimetype="text/html")
 
 if __name__ == "__main__":
     from waitress import serve

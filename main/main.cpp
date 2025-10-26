@@ -158,6 +158,12 @@ struct power_stats_t {
   uint32_t uplink_bytes = 0;
 } g_pwr;
 
+// ---- Fault/event log (cleared after each successful upload) ----
+static std::vector<std::string> g_events;
+static inline void log_event(const char* e){ g_events.emplace_back(e); }
+static inline void log_eventf(const char* tag, int v){
+  char b[64]; snprintf(b,sizeof(b),"%s:%d",tag,v); g_events.emplace_back(b);
+}
 
 
 static inline uint64_t now_ms() { return (uint64_t)esp_timer_get_time()/1000ULL; }
@@ -384,10 +390,11 @@ static void task_uplink(void*){
       g_cfg_ack_json.clear();
     }
 
-    // NEW (M4): expose compact FOTA error + next_chunk for retry-friendly server behavior
+    // expose compact FOTA error + next_chunk for retry-friendly server behavior
     {
       std::string fe = fota_pull_error_string();
       if (!fe.empty()) {
+        log_event(("fota_err:" + fe).c_str());
         if (body_json.back()=='}') {
           char buf[160];
           snprintf(buf, sizeof(buf), ",\"fota\":{\"error\":\"%s\",\"next_chunk\":%lu}",
@@ -416,7 +423,20 @@ static void task_uplink(void*){
         g_idle_budget_ms = 0;             // reset idle budget
       }
     }
-
+      // Append events[] (then clear)
+      if (!g_events.empty() && body_json.back()=='}') {
+        body_json.pop_back();
+        body_json += ",\"events\":[";
+        for (size_t i=0;i<g_events.size();++i){
+          body_json += "\"";
+          // naive JSON escape for quotes/backslashes:
+          for (char c: g_events[i]) { if (c=='\\' || c=='"') body_json += '\\'; body_json += c; }
+          body_json += "\"";
+          if (i+1<g_events.size()) body_json += ",";
+        }
+        body_json += "]}";
+        g_events.clear();
+    }
 
     // Envelope
     std::string psk = CONFIG_ECOWATT_PSK;
@@ -439,15 +459,37 @@ static void task_uplink(void*){
     #endif
     uint64_t t0 = now_ms();
     std::string reply;
-    bool ok = uplink::post_payload_and_get_reply(
-                CONFIG_ECOWATT_CLOUD_BASE_URL,
-                CONFIG_ECOWATT_CLOUD_KEY_B64,
-                to_send,
-                reply);
+    bool ok = false;
+    const int kMaxTry = 3;
+    uint32_t backoff_ms = 1000;
+
+    for (int attempt = 1; attempt <= kMaxTry; ++attempt) {
+      reply.clear();
+      ok = uplink::post_payload_and_get_reply(
+              CONFIG_ECOWATT_CLOUD_BASE_URL,
+              CONFIG_ECOWATT_CLOUD_KEY_B64,
+              to_send,
+              reply);
+
+      if (ok) break;
+
+      log_eventf("uplink_fail_try", attempt);
+      if (attempt < kMaxTry) vTaskDelay(pdMS_TO_TICKS(backoff_ms));
+      backoff_ms *= 2; // 1s -> 2s -> 4s
+    }
     g_pwr.t_uplink_ms += (now_ms() - t0);
     g_pwr.uplink_bytes += (uint32_t)to_send.size();
-    ESP_LOGI(TAG, "[PWR-DBG] idle=%" PRIu64 " sleep=%" PRIu64 " uplink=%" PRIu64 " bytes=%u",
-         g_idle_budget_ms, g_pwr.t_sleep_ms, g_pwr.t_uplink_ms, (unsigned)g_pwr.uplink_bytes);
+
+
+    // ESP_LOGI(TAG, "[PWR-DBG] idle=%" PRIu64 " sleep=%" PRIu64 " uplink=%" PRIu64 " bytes=%u",
+    //         (unsigned long long)g_idle_budget_ms,
+    //         (unsigned long long)g_pwr.t_sleep_ms,
+    //         (unsigned long long)g_pwr.t_uplink_ms,
+    //         (unsigned)g_pwr.uplink_bytes);
+
+    ESP_LOGI(TAG, "[PWR-DBG]   uplink=%" PRIu64 " bytes=%u",
+            (unsigned long long)g_pwr.t_uplink_ms,
+            (unsigned)g_pwr.uplink_bytes);
 
     // // Restore idle PS mode right after the burst
     // #if CONFIG_ECOWATT_WIFI_PS_MODE == 1
@@ -514,7 +556,8 @@ static void task_uplink(void*){
           if (cur_ids == new_ids) unchanged.push_back("registers");
           else { next.fields = fids_new; accepted.push_back("registers"); }
         }
-
+        for (auto& k : accepted)  log_event(("cfg_ok:"  + k).c_str());
+        for (auto& k : rejected)  log_event(("cfg_bad:" + k).c_str());
         // apply-at-next-slot
         g_cfg_next = next; 
         g_has_pending_cfg = true;
@@ -536,7 +579,7 @@ static void task_uplink(void*){
       if(inner.find("\"command\"") != std::string::npos){
         auto vpos = inner.find("\"value\""); int val=-1;
         if(vpos!=std::string::npos){ vpos = inner.find(':', vpos); if(vpos!=std::string::npos) val = std::strtol(inner.c_str()+vpos+1, nullptr, 10); }
-        if(val>=0){ g_cmd.has_cmd = true; g_cmd.export_pct = val; g_cmd.received_at_ms = now_ms_epoch(); }
+        if(val>=0){ g_cmd.has_cmd = true; g_cmd.export_pct = val; g_cmd.received_at_ms = now_ms_epoch();log_eventf("cmd_export_pct", val); }
       }
 
       // FOTA (manifest + chunk)
