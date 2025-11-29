@@ -58,9 +58,9 @@ The server (`server/app.py`) handles data uploads from devices and serves FOTA u
    New-Item -ItemType Directory .\logs | Out-Null
 
    $logs  = "$PWD\logs"
-   $bin   = "..\build\ecowatt.bin"  
+   $bin   = "D:\sem 07\Embedded\Ecowatt_Polaris\build\EcoWatt.bin"  
    $chunk = 8192
-   $ver   = "1.0.4"   # bump version to force a fresh session
+   $ver   = "1.0.6"   # bump version to force a fresh session
    $bytes = [IO.File]::ReadAllBytes($bin)
    $size  = $bytes.Length
    $hash  = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLower()

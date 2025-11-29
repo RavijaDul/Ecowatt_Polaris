@@ -1,5 +1,8 @@
 # app.py
-import os, time, base64, json, sqlite3, pathlib, datetime, glob, hmac
+import os, time, base64, json, sqlite3, pathlib, datetime, glob, hmac, io, csv
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 from typing import List, Tuple, Optional
 from flask import Flask, request, jsonify, g, Response, redirect, url_for
 import requests
@@ -60,6 +63,16 @@ CREATE TABLE IF NOT EXISTS power_stats (
   uplink_bytes  INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_power_stats_dev_time ON power_stats(device, received_at);
+
+CREATE TABLE IF NOT EXISTS buffer_stats (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    device TEXT NOT NULL,
+    received_at INTEGER NOT NULL,
+    dropped_samples INTEGER DEFAULT 0,
+    acq_failures INTEGER DEFAULT 0,
+    transport_failures INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_buffer_stats_dev_time ON buffer_stats(device, received_at);
 
 CREATE TABLE IF NOT EXISTS device_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,13 +342,49 @@ def device_upload():
             # --- cleanup old FOTA files after successful update ---
             try:
                 man_path = os.path.join(LOG_DIR, "fota_manifest.json")
-                if os.path.exists(man_path):
-                    os.remove(man_path)
-                for p in glob.glob(os.path.join(LOG_DIR, "fota_chunk_*.b64")):
-                    os.remove(p)
-                if dev in LAST_FOTA:
-                    del LAST_FOTA[dev]
-                print(f"[FOTA] Cleanup done after boot_ok for {dev}", flush=True)
+                # Only remove artifacts if manifest exists and matches the version we served to this device
+                if os.path.exists(man_path) and dev in LAST_FOTA:
+                    try:
+                        mf = json.loads(open(man_path, "r").read())
+                    except Exception:
+                        mf = None
+                    served = LAST_FOTA.get(dev, {})
+                    served_ver = served.get("version")
+                    mf_ver = mf.get("version") if isinstance(mf, dict) else None
+                    mf_size = int(mf.get("size") or 0) if isinstance(mf, dict) else 0
+
+                    # Check recorded progress to ensure we finished
+                    db = get_db()
+                    row = db.execute("SELECT written, size, percent FROM fota_progress WHERE device=?", (dev,)).fetchone()
+                    written = int(row[0]) if row and row[0] is not None else 0
+                    total   = int(row[1]) if row and row[1] is not None else mf_size
+
+                    if mf_ver and served_ver and mf_ver == served_ver and (total == 0 or written >= total):
+                        # safe to delete manifest + chunks for this manifest
+                        try:
+                            os.remove(man_path)
+                        except Exception:
+                            pass
+                        for p in glob.glob(os.path.join(LOG_DIR, "fota_chunk_*.b64")):
+                            try:
+                                os.remove(p)
+                            except Exception:
+                                pass
+                        # remove LAST_FOTA for this device
+                        if dev in LAST_FOTA:
+                            del LAST_FOTA[dev]
+                        # mark progress as complete (100%) and keep a final event
+                        upsert_progress(dev, mf_ver, total, total)
+                        log_fota(dev, "boot_cleanup", f"cleaned {mf_ver}")
+                        print(f"[FOTA] Cleanup done after boot_ok for {dev} manifest={mf_ver}", flush=True)
+                    else:
+                        print(f"[FOTA] Boot OK for {dev} but manifest mismatch or incomplete progress (mf_ver={mf_ver} served_ver={served_ver} written={written} total={total}); skipping cleanup", flush=True)
+                else:
+                    # no manifest present or no record of serving this device
+                    if os.path.exists(man_path):
+                        print(f"[FOTA] Boot OK for {dev} but no LAST_FOTA entry; not deleting {man_path}", flush=True)
+                    else:
+                        print(f"[FOTA] Boot OK for {dev} but no manifest file present", flush=True)
             except Exception as e:
                 print(f"[FOTA] Cleanup error: {e}", flush=True)
 
@@ -387,6 +436,22 @@ def device_upload():
             print(f"[PWR] dev={dev} idle={idle_b}ms uplink={t_uplink}ms bytes={ubytes}", flush=True)
         except Exception as e:
             print(f"[PWR] insert error: {e}", flush=True)
+
+    # --- Diagnostic counters (buffer/transport visibility) ---
+    diag = body.get("diag")
+    if isinstance(diag, dict):
+        try:
+            dropped = int(diag.get("dropped_samples") or 0)
+            acqf = int(diag.get("acq_failures") or 0)
+            tf = int(diag.get("transport_failures") or 0)
+            db = get_db()
+            db.execute(
+                "INSERT INTO buffer_stats(device, received_at, dropped_samples, acq_failures, transport_failures) VALUES(?,?,?,?,?)",
+                (dev, now_ms, dropped, acqf, tf)
+            )
+            db.commit()
+        except Exception as e:
+            print(f"[DIAG] insert error: {e}", flush=True)
 
     # --------- Store upload ---------
     db = get_db()
@@ -666,6 +731,35 @@ def admin_fota_device(device: str):
         out.append(f"<tr><td>{ts}</td><td>{kind}</td><td class='mono'>{detail}</td></tr>")
     out.append("</table>" + HTML_TAIL)
     return Response("".join(out), mimetype="text/html")
+
+
+@app.route("/admin/fota/cleanup", methods=["POST"])
+def admin_fota_cleanup():
+    # Manual cleanup: deletes manifest and chunk files if present.
+    # Body/form: optional 'version' to restrict deletion to a specific manifest version.
+    ver = request.form.get("version") or request.args.get("version")
+    man_path = os.path.join(LOG_DIR, "fota_manifest.json")
+    if not os.path.exists(man_path):
+        return jsonify({"ok": False, "error": "no-manifest"}), 404
+    try:
+        mf = json.loads(open(man_path, "r").read())
+    except Exception as e:
+        return jsonify({"ok": False, "error": "bad-manifest", "detail": str(e)}), 400
+    mf_ver = mf.get("version")
+    if ver and ver != mf_ver:
+        return jsonify({"ok": False, "error": "version-mismatch", "manifest_version": mf_ver}), 400
+    # delete manifest + chunks
+    try:
+        os.remove(man_path)
+    except Exception:
+        pass
+    removed = 0
+    for p in glob.glob(os.path.join(LOG_DIR, "fota_chunk_*.b64")):
+        try:
+            os.remove(p); removed += 1
+        except Exception:
+            pass
+    return jsonify({"ok": True, "removed_chunks": removed, "manifest_version": mf_ver})
 @app.get("/api/fota/progress")
 def api_fota_progress_all():
     db = get_db()
@@ -829,6 +923,106 @@ def api_power_device(device: str):
         "t_sleep_ms": r[2], "t_uplink_ms": r[3], "uplink_bytes": r[4]}
         for r in rows
     ])
+
+
+@app.post("/api/power/snapshot")
+def api_power_snapshot():
+    """Collect an N-minute snapshot for a device, save JSON/CSV/PNG in LOG_DIR and return paths.
+    Params: device (required), minutes (optional, default=5), max_samples (optional)
+    """
+    req = request.get_json(force=True, silent=True) or {}
+    dev = request.args.get("device") or req.get("device")
+    if not dev: return jsonify({"ok": False, "error": "missing device"}), 400
+    minutes = int(request.args.get("minutes") or req.get("minutes") or 5)
+    max_samples = int(request.args.get("max_samples") or req.get("max_samples") or 10000)
+    now_ms_val = int(time.time() * 1000)
+    cutoff = now_ms_val - (minutes * 60 * 1000)
+    db = get_db()
+    rows = db.execute("""
+        SELECT received_at, idle_budget_ms, t_sleep_ms, t_uplink_ms, uplink_bytes
+        FROM power_stats
+        WHERE device=? AND received_at>=?
+        ORDER BY received_at DESC
+        LIMIT ?
+    """, (dev, cutoff, max_samples)).fetchall()
+    data = [
+        {"received_at_ms": r[0], "idle_budget_ms": r[1], "t_sleep_ms": r[2], "t_uplink_ms": r[3], "uplink_bytes": r[4]}
+        for r in rows
+    ]
+    pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
+    ts = int(time.time())
+    base = os.path.join(LOG_DIR, f"power_snapshot_{dev}_{ts}")
+    json_path = base + ".json"
+    csv_path = base + ".csv"
+    png_path = base + ".png"
+    # write json
+    open(json_path, "w").write(json.dumps(data, indent=2))
+    # write csv
+    try:
+        with open(csv_path, "w", newline='') as cf:
+            w = csv.writer(cf)
+            w.writerow(["received_at_ms", "idle_budget_ms", "t_sleep_ms", "t_uplink_ms", "uplink_bytes"])
+            for r in data:
+                w.writerow([r['received_at_ms'], r['idle_budget_ms'], r['t_sleep_ms'], r['t_uplink_ms'], r['uplink_bytes']])
+    except Exception as e:
+        return jsonify({"ok": False, "error": "csv_write_failed", "detail": str(e)}), 500
+    # create PNG plot
+    try:
+        if data:
+            xs = [datetime.datetime.fromtimestamp(d['received_at_ms']/1000.0) for d in reversed(data)]
+            sleep_y = [d['t_sleep_ms'] for d in reversed(data)]
+            uplink_y = [d['t_uplink_ms'] for d in reversed(data)]
+            idle_y = [d['idle_budget_ms'] for d in reversed(data)]
+            fig, ax = plt.subplots(3, 1, figsize=(10,6), sharex=True)
+            ax[0].plot(xs, sleep_y, '-o', label='t_sleep_ms')
+            ax[0].legend(); ax[0].grid(True)
+            ax[1].plot(xs, uplink_y, '-o', label='t_uplink_ms', color='C1')
+            ax[1].legend(); ax[1].grid(True)
+            ax[2].plot(xs, idle_y, '-o', label='idle_budget_ms', color='C2')
+            ax[2].legend(); ax[2].grid(True)
+            fig.autofmt_xdate()
+            fig.suptitle(f"Power snapshot for {dev} (last {minutes} min)")
+            fig.tight_layout(rect=[0,0,1,0.96])
+            fig.savefig(png_path)
+            plt.close(fig)
+    except Exception as e:
+        return jsonify({"ok": False, "error": "plot_failed", "detail": str(e)}), 500
+
+    return jsonify({"ok": True, "device": dev, "count": len(data), "json": json_path, "csv": csv_path, "png": png_path})
+
+
+@app.get("/api/buffer/<device>")
+def api_buffer_device(device: str):
+    db = get_db()
+    rows = db.execute("""
+        SELECT received_at, dropped_samples, acq_failures, transport_failures
+        FROM buffer_stats
+        WHERE device=?
+        ORDER BY received_at DESC
+        LIMIT 1000
+    """, (device,)).fetchall()
+    return jsonify([
+        {"received_at_ms": r[0], "dropped_samples": r[1], "acq_failures": r[2], "transport_failures": r[3]}
+        for r in rows
+    ])
+
+
+@app.get("/admin/buffer")
+def admin_buffer():
+    db = get_db()
+    summary = db.execute("""
+        SELECT device, COUNT(*) AS n, MAX(received_at) AS last_recv, SUM(dropped_samples) AS drops
+        FROM buffer_stats
+        GROUP BY device
+        ORDER BY last_recv DESC
+    """).fetchall()
+    out = [HTML_HEAD, "<h2>Buffer – Summary by Device</h2>"]
+    out.append("<table class='table'><tr><th>Device</th><th>Samples</th><th>Total Drops</th><th>Last Received</th></tr>")
+    for dev,n,drops,last in summary:
+        last_h = datetime.datetime.fromtimestamp(last/1000.0).strftime('%Y-%m-%d %H:%M:%S') if last else '-'
+        out.append(f"<tr><td>{dev}</td><td>{n}</td><td>{drops or 0}</td><td>{last_h}</td></tr>")
+    out.append("</table>" + HTML_TAIL)
+    return Response("".join(out), mimetype="text/html")
 
 @app.get("/admin/events")
 def admin_events():

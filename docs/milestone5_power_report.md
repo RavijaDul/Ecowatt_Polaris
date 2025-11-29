@@ -1,0 +1,12 @@
+**Power Report**
+- **Purpose:** Collect before/after server-side power instrumentation to measure the effect of changes (Wi‑Fi gating, light-sleep etc.).
+- **Script:** `scripts/power_report.py` — snapshots data from the server and compares two snapshots.
+- **Server endpoints used:** `GET /api/power/<device>` — returns recent power records in JSON. Ensure the server exposes this API and that device uploads include `t_sleep_ms`, `t_uplink_ms`, `idle_budget_ms`, and `uplink_bytes` fields in the payload.
+- **Typical workflow:**
+- 1. Run `python scripts/power_report.py snapshot --url http://localhost:5000 --device <device-id> --out before.json` to capture the baseline.
+- 2. Deploy firmware changes (enable light-sleep, Wi‑Fi gating) to device(s).
+- 3. Run the same command to capture `after.json` after the device has run for the same observation period.
+- 4. Run `python scripts/power_report.py compare --before before.json --after after.json` to get averages and deltas.
+- **Notes:**
+- Capture snapshots for comparable durations and traffic patterns (same sampling interval, same remote server). Prefer at least several minutes of records (10–30 samples) for reliable averages when sampling at 5s.
+- If your server API path differs, update the script or use an HTTP proxy to map paths.

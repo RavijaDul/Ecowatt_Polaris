@@ -59,6 +59,15 @@
 #define CONFIG_ECOWATT_SLEEP_MARGIN_MS 30
 #endif
 
+#ifndef CONFIG_ECOWATT_SAFE_MIN_SLEEP_MS
+#define CONFIG_ECOWATT_SAFE_MIN_SLEEP_MS 50
+#endif
+
+#ifndef CONFIG_ECOWATT_WIFI_GATE_MIN_INTERVAL_SEC
+// Min upload interval (seconds) required to safely gate Wi-Fi between uploads
+#define CONFIG_ECOWATT_WIFI_GATE_MIN_INTERVAL_SEC 30
+#endif
+
 #ifndef CONFIG_ECOWATT_PS_BURST_TOGGLE
 #define CONFIG_ECOWATT_PS_BURST_TOGGLE 0   // keep 0 to avoid AP hiccups
 #endif
@@ -76,6 +85,7 @@
 #include <inttypes.h>
 #include <algorithm>
 #include <vector>
+#include <inttypes.h>
 
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -97,6 +107,7 @@
 #include "packetizer.hpp"
 #include "codec.hpp"
 #include "security.hpp"
+#include "transport.hpp"
 #include "nvstore.hpp"
 #include "control.hpp"
 #include "fota.hpp"
@@ -135,6 +146,8 @@ static esp_pm_lock_handle_t s_pm_lock = nullptr;
 static uint64_t g_idle_budget_ms = 0;
 
 static acquisition::Acquisition* g_acq = nullptr;
+static uint32_t g_dropped_samples = 0;
+static uint32_t g_acq_failures = 0;
 struct {
   bool has = false;
   uint32_t written = 0;
@@ -278,23 +291,42 @@ static void task_acq(void*){
 
     acquisition::Sample s{};
     std::vector<int> fids; for (auto f: g_cfg_cur.fields) fids.push_back((int)f);
-    if (!fids.empty()) g_acq->read_selected(fids, s); else g_acq->read_all(s);
+    bool ok = false;
+    if (!fids.empty()) ok = g_acq->read_selected(fids, s); else ok = g_acq->read_all(s);
+
+    if (!ok) {
+      ++g_acq_failures;
+      // log event only on repeated failures to avoid log spam
+      if ((g_acq_failures % 3) == 0) log_event("acq_read_fail");
+    }
 
     buffer::Record rec{ now_ms_epoch(), s };
-    xSemaphoreTake(g_ring_mtx, portMAX_DELAY); g_ring->push(rec); xSemaphoreGive(g_ring_mtx);
+    xSemaphoreTake(g_ring_mtx, portMAX_DELAY);
+    bool overflow = g_ring->push(rec);
+    xSemaphoreGive(g_ring_mtx);
+    if (overflow) { ++g_dropped_samples; log_event("buffer_overflow"); }
 
     ESP_LOGI(TAG, "ACQ tick @ %" PRIu64 " ms (epoch)", rec.epoch_ms);
 
-    // (optional) manual sleep is OFF for now, so this block is skipped
-  #if CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP
-    uint64_t next_tick_ms = loop_start_ms + (uint64_t)period_ms;
-    eco_light_sleep_until(next_tick_ms);
-  #endif
+  //   // (optional) manual sleep is OFF for now, so this block is skipped
+  // #if CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP
+  //   uint64_t next_tick_ms = loop_start_ms + (uint64_t)period_ms;
+  //   eco_light_sleep_until(next_tick_ms);
+  // #endif
 
   // Idle budget = how much of this period we didn't use
   uint64_t work_ms = now_ms() - loop_start_ms;
   if (work_ms < period_ms) g_idle_budget_ms += (period_ms - work_ms);
 
+  // inside task_acq loop, after work_ms computed
+  #if CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP
+    const uint32_t safe_min_sleep_ms = 50; // minimal useful sleep (tune with measurements)
+    uint64_t next_tick_ms = loop_start_ms + (uint64_t)period_ms;
+    uint64_t now = now_ms();
+    if (next_tick_ms > now + CONFIG_ECOWATT_SLEEP_MARGIN_MS + safe_min_sleep_ms) {
+      eco_light_sleep_until(next_tick_ms);
+    } // else skip sleeping because window too small
+  #endif
     vTaskDelayUntil(&last, period_ticks);
 
     if (period_ms != g_cfg_cur.sampling_interval_ms) {
@@ -328,7 +360,7 @@ static void task_uplink(void*){
     std::string body_json;
     if(!batch.empty()){
       codec::BenchResult br = codec::run_benchmark_delta_rle_v1(batch);
-      double ratio = (br.comp_bytes>0)? double(br.orig_bytes)/double(br.comp_bytes) : 0.0;
+      double ratio = (br.orig_bytes>0)? double(br.comp_bytes)/double(br.orig_bytes) : 0.0;
       ESP_LOGI(TAG,"[BENCH] n=%u orig=%uB comp=%uB ratio=%.2fx encode=%.3fms lossless=%s",
                (unsigned)br.n_samples,(unsigned)br.orig_bytes,(unsigned)br.comp_bytes,ratio,br.encode_ms,br.lossless_ok?"yes":"NO");
       auto payload = uplink::build_payload(batch, CONFIG_ECOWATT_DEVICE_ID);
@@ -423,6 +455,15 @@ static void task_uplink(void*){
         g_idle_budget_ms = 0;             // reset idle budget
       }
     }
+    // Append diagnostic counters (dropped samples, acquisition failures, transport failures)
+    if (body_json.back()=='}') {
+      char dbuf[128];
+      snprintf(dbuf, sizeof(dbuf), ",\"diag\":{\"dropped_samples\":%u,\"acq_failures\":%u,\"transport_failures\":%u}",
+               (unsigned)g_dropped_samples, (unsigned)g_acq_failures, (unsigned)transport::get_conn_failures());
+      body_json.pop_back(); body_json += dbuf; body_json += "}";
+      // reset dropped counter after reporting
+      g_dropped_samples = 0;
+    }
       // Append events[] (then clear)
       if (!g_events.empty() && body_json.back()=='}') {
         body_json.pop_back();
@@ -450,33 +491,31 @@ static void task_uplink(void*){
     // POST (keep CPU at max during network burst)
     if (s_pm_lock) esp_pm_lock_acquire(s_pm_lock);   // <-- acquire AFTER to_send is ready
 
-    // Temporarily disable Wi-Fi PS for throughput
-    // #if CONFIG_ECOWATT_WIFI_PS_MODE == 1
-    //   esp_wifi_set_ps(WIFI_PS_NONE);esp_wifi_start()
-    // #endif
+    // Optionally gate Wi-Fi between uploads if configured and interval is large enough
+    bool can_gate_wifi = (CONFIG_ECOWATT_WIFI_GATE_BETWEEN_UPLOADS == 1) &&
+                         (CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC >= CONFIG_ECOWATT_WIFI_GATE_MIN_INTERVAL_SEC);
+
+    if (can_gate_wifi) {
+      // ensure Wi-Fi is started and connected before uploading
+      if ((xEventGroupGetBits(s_evt) & BIT_GOT_IP) == 0) {
+        esp_wifi_start();
+        esp_wifi_connect();
+        // wait up to 20s for IP
+        (void)xEventGroupWaitBits(s_evt, BIT_GOT_IP, pdFALSE, pdFALSE, pdMS_TO_TICKS(20000));
+      }
+    }
+
+    // Temporarily disable Wi-Fi PS for throughput during upload if burst toggle enabled
     #if CONFIG_ECOWATT_PS_BURST_TOGGLE
       esp_wifi_set_ps(WIFI_PS_NONE);   // BEFORE POST
     #endif
     uint64_t t0 = now_ms();
     std::string reply;
-    bool ok = false;
-    const int kMaxTry = 3;
-    uint32_t backoff_ms = 1000;
-
-    for (int attempt = 1; attempt <= kMaxTry; ++attempt) {
-      reply.clear();
-      ok = uplink::post_payload_and_get_reply(
+    bool ok = uplink::post_payload_and_get_reply(
               CONFIG_ECOWATT_CLOUD_BASE_URL,
               CONFIG_ECOWATT_CLOUD_KEY_B64,
               to_send,
               reply);
-
-      if (ok) break;
-
-      log_eventf("uplink_fail_try", attempt);
-      if (attempt < kMaxTry) vTaskDelay(pdMS_TO_TICKS(backoff_ms));
-      backoff_ms *= 2; // 1s -> 2s -> 4s
-    }
     g_pwr.t_uplink_ms += (now_ms() - t0);
     g_pwr.uplink_bytes += (uint32_t)to_send.size();
 
@@ -498,6 +537,12 @@ static void task_uplink(void*){
     #if CONFIG_ECOWATT_PS_BURST_TOGGLE
       esp_wifi_set_ps(WIFI_PS_MIN_MODEM); // AFTER POST
     #endif
+
+    if (can_gate_wifi) {
+      // stop Wi-Fi until next upload to save power
+      esp_wifi_stop();
+      xEventGroupClearBits(s_evt, BIT_GOT_IP | BIT_CONNECTED);
+    }
 
     if (s_pm_lock) esp_pm_lock_release(s_pm_lock);   // release immediately after POST
 
@@ -688,6 +733,10 @@ extern "C" void app_main(void) {
   g_ring = &ring; g_ring_mtx = xSemaphoreCreateMutex();
 
   fota::init();
+
+  // Tune retry/backoff policies for transport and cloud uplink
+  transport::set_retry_policy(3, 200 /*ms base*/, 2000 /*ms max*/);
+  uplink::set_retry_policy(3, 1000 /*ms base*/, 4000 /*ms max*/);
 
   xTaskCreatePinnedToCore(task_acq,   "acq",   4096, nullptr, 5, nullptr, 0);
   xTaskCreatePinnedToCore(task_uplink,"uplink",8192, nullptr, 5, nullptr, 0);
