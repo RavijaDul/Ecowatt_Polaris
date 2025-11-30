@@ -24,6 +24,8 @@ dist/
 wheels/
 .eggs/
 
+docs/
+milestone5_power_report.md
 # --- Logs / Databases / Coverage ---
 *.log
 *.pot

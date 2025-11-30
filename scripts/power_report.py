@@ -29,12 +29,27 @@ def summarize_list(rows):
     sleep = [r['t_sleep_ms'] for r in rows]
     uplink = [r['t_uplink_ms'] for r in rows]
     bytes_ = [r['uplink_bytes'] for r in rows]
+    # energy estimate using env or defaults (mV,mA)
+    import os
+    V_mV = int(os.getenv('POWER_V_SUPPLY_MV') or 5000)
+    I_active = int(os.getenv('POWER_I_ACTIVE_MA') or 200)
+    I_uplink = int(os.getenv('POWER_I_UPLINK_MA') or 300)
+    I_sleep = int(os.getenv('POWER_I_SLEEP_MA') or 5)
+    total_sleep_s = sum(sleep)/1000.0
+    total_uplink_s = sum(uplink)/1000.0
+    total_idle_s = sum(idle)/1000.0
+    V = V_mV/1000.0
+    E_sleep = V*(I_sleep/1000.0)*total_sleep_s
+    E_uplink = V*(I_uplink/1000.0)*total_uplink_s
+    E_idle = V*(I_active/1000.0)*total_idle_s
+    energy_J = E_sleep + E_uplink + E_idle
     return {
         'n': len(rows),
         'idle_avg': statistics.mean(idle),
         'sleep_avg': statistics.mean(sleep),
         'uplink_avg': statistics.mean(uplink),
         'bytes_avg': statistics.mean(bytes_)
+        , 'est_energy_J': energy_J
     }
 
 

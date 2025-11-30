@@ -18,7 +18,7 @@ config ECOWATT_API_KEY_B64
 
 config ECOWATT_CLOUD_BASE_URL
     string "EcoWatt Cloud Base URL (HTTP/HTTPS)"
-    default "http://192.168.246.159:5000"  
+    default "http://192.168.8.103:5000"  
 
 config ECOWATT_CLOUD_KEY_B64
     string "EcoWatt Cloud API key (Authorization header - e.g., 'Basic <base64>')"
@@ -45,5 +45,43 @@ config ECOWATT_PSK
 config ECOWATT_USE_ENVELOPE
     bool "Use HMAC envelope for device↔cloud"
     default y
+
+config ECOWATT_MANUAL_LIGHT_SLEEP
+    bool "Allow manual light-sleep between sampling ticks"
+    default n
+
+config ECOWATT_ENABLE_AUTO_LIGHT_SLEEP
+    bool "Enable automatic light-sleep via ESP power manager"
+    default n
+
+config ECOWATT_SAFE_MIN_SLEEP_MS
+    int "Safe minimal sleep window (ms) for manual light-sleep"
+    range 0 1000
+    default 50
+
+config ECOWATT_WIFI_GATE_BETWEEN_UPLOADS
+    bool "Stop/start Wi‑Fi between uploads when beneficial"
+    default n
+
+config ECOWATT_WIFI_GATE_MIN_INTERVAL_SEC
+    int "Minimum upload interval (sec) to allow Wi‑Fi gating"
+    range 5 86400
+    default 30
+
+config ECOWATT_POWER_V_SUPPLY
+    int "Assumed supply voltage (mV) for energy estimation"
+    default 5000
+
+config ECOWATT_POWER_I_ACTIVE_MA
+    int "Assumed device active current (mA) for energy estimation"
+    default 200
+
+config ECOWATT_POWER_I_UPLINK_MA
+    int "Assumed uplink/network burst current (mA) for energy estimation"
+    default 300
+
+config ECOWATT_POWER_I_SLEEP_MA
+    int "Assumed light-sleep current (mA) for energy estimation"
+    default 5
 
 endmenu

@@ -983,7 +983,35 @@ def api_power_snapshot():
             fig.autofmt_xdate()
             fig.suptitle(f"Power snapshot for {dev} (last {minutes} min)")
             fig.tight_layout(rect=[0,0,1,0.96])
+            # compute energy estimate using env or defaults (mV, mA assumptions)
+            try:
+                V_mV = int(os.getenv('POWER_V_SUPPLY_MV') or os.getenv('ECOWATT_POWER_V_SUPPLY') or 5000)
+                I_active = int(os.getenv('POWER_I_ACTIVE_MA') or os.getenv('ECOWATT_POWER_I_ACTIVE_MA') or 200)
+                I_uplink = int(os.getenv('POWER_I_UPLINK_MA') or os.getenv('ECOWATT_POWER_I_UPLINK_MA') or 300)
+                I_sleep = int(os.getenv('POWER_I_SLEEP_MA') or os.getenv('ECOWATT_POWER_I_SLEEP_MA') or 5)
+                # compute totals (ms)
+                total_sleep_ms = sum(sleep_y)
+                total_uplink_ms = sum(uplink_y)
+                total_idle_ms = sum(idle_y)
+                # convert to seconds
+                s_sleep = total_sleep_ms/1000.0
+                s_uplink = total_uplink_ms/1000.0
+                s_idle = total_idle_ms/1000.0
+                # estimate energy (J) = V * I * t  (V in volts, I in A)
+                V = V_mV / 1000.0
+                E_sleep = V * (I_sleep/1000.0) * s_sleep
+                E_uplink = V * (I_uplink/1000.0) * s_uplink
+                E_idle = V * (I_active/1000.0) * s_idle
+                E_total = E_sleep + E_uplink + E_idle
+                est_text = f"Est energy: {E_total:.2f} J (sleep={E_sleep:.2f} J uplink={E_uplink:.2f} J idle={E_idle:.2f} J)"
+            except Exception:
+                est_text = "Est energy: n/a"
             fig.savefig(png_path)
+            # write a small .meta.json alongside containing energy estimate
+            try:
+                open(base + ".meta.json", "w").write(json.dumps({"energy_estimate_j": E_total, "detail": est_text}, indent=2))
+            except Exception:
+                pass
             plt.close(fig)
     except Exception as e:
         return jsonify({"ok": False, "error": "plot_failed", "detail": str(e)}), 500
