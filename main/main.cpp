@@ -15,7 +15,7 @@
 #define CONFIG_ECOWATT_API_KEY_B64 ""
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_BASE_URL
-#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.8.103:5000"
+#define CONFIG_ECOWATT_CLOUD_BASE_URL "http://192.168.8.195:5000"
 #endif
 #ifndef CONFIG_ECOWATT_CLOUD_KEY_B64
 #define CONFIG_ECOWATT_CLOUD_KEY_B64 ""
@@ -27,7 +27,7 @@
 #define CONFIG_ECOWATT_SAMPLE_PERIOD_MS 5000
 #endif
 #ifndef CONFIG_ECOWATT_DEVICE_ID
-#define CONFIG_ECOWATT_DEVICE_ID "EcoWatt-Dev-01-optimized"
+#define CONFIG_ECOWATT_DEVICE_ID "EcoWatt-Dev-01"
 #endif
 #ifndef CONFIG_ECOWATT_PSK
 #define CONFIG_ECOWATT_PSK "ecowatt-demo-psk"
@@ -164,6 +164,12 @@ struct {
   bool has = false;   // set once on first successful boot after OTA
 } g_fota_bootack;
 
+struct {
+  bool has = false;
+  std::string reason = "";  // "corruption" or "boot_failed"
+  std::string version = "";
+} g_fota_failure;
+
 // --- Power instrumentation ---
 struct power_stats_t {
   uint64_t t_sleep_ms  = 0;
@@ -177,6 +183,14 @@ static inline void log_event(const char* e){ g_events.emplace_back(e); }
 static inline void log_eventf(const char* tag, int v){
   char b[64]; snprintf(b,sizeof(b),"%s:%d",tag,v); g_events.emplace_back(b);
 }
+
+// ---- SIM Fault tracking ----
+struct {
+  bool has_fault = false;
+  std::string fault_type = "";     // "exception", "crc_error", "corrupt", "packet_drop", "timeout"
+  uint8_t exception_code = 0;      // Modbus exception code (01-0B)
+  std::string last_error = "";     // Description of last fault
+} g_sim_fault;
 
 
 static inline uint64_t now_ms() { return (uint64_t)esp_timer_get_time()/1000ULL; }
@@ -199,6 +213,17 @@ extern "C" void fota_progress_notify(uint32_t written, uint32_t total){
 }
 
 // Helper: pull last FOTA error string from fota::status_json() for retry hint
+// Called by acquisition when SIM faults occur
+extern "C" void sim_fault_notify(const char* fault_type, uint8_t exception_code, const char* description){
+  g_sim_fault.has_fault = true;
+  g_sim_fault.fault_type = fault_type ? fault_type : "unknown";
+  g_sim_fault.exception_code = exception_code;
+  g_sim_fault.last_error = description ? description : "";
+  log_event(("sim_fault:" + g_sim_fault.fault_type).c_str());
+  ESP_LOGE(TAG, "SIM FAULT: type=%s exc=0x%02x desc=%s", 
+           g_sim_fault.fault_type.c_str(), exception_code, description ? description : "");
+}
+
 static std::string fota_pull_error_string(){
   std::string s = fota::status_json();
   auto k = s.find("\"error\":\"");
@@ -400,6 +425,14 @@ static void task_uplink(void*){
       if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
       g_fota_report.has = false;
     }
+    // FOTA failure report (corruption or boot failure)
+    if (g_fota_failure.has) {
+      char buf[160];
+      snprintf(buf, sizeof(buf), ",\"fota\":{\"failure\":{\"reason\":\"%s\",\"version\":\"%s\"}}", 
+               g_fota_failure.reason.c_str(), g_fota_failure.version.c_str());
+      if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
+      g_fota_failure.has = false;
+    }
     // One-shot boot confirmation (set in app_main after cancel_rollback)
     if (g_fota_bootack.has){
       char buf[64];
@@ -420,6 +453,15 @@ static void task_uplink(void*){
       }
       g_cfg_ack_ready = false;
       g_cfg_ack_json.clear();
+    }
+
+    // SIM Fault reporting
+    if (g_sim_fault.has_fault) {
+      char buf[256];
+      snprintf(buf, sizeof(buf), ",\"sim_fault\":{\"type\":\"%s\",\"exception_code\":%u,\"description\":\"%s\"}",
+               g_sim_fault.fault_type.c_str(), (unsigned)g_sim_fault.exception_code, g_sim_fault.last_error.c_str());
+      if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
+      g_sim_fault.has_fault = false;
     }
 
     // expose compact FOTA error + next_chunk for retry-friendly server behavior
@@ -676,6 +718,20 @@ static void task_uplink(void*){
       g_fota_report.verify_ok = ok_verify;
       g_fota_report.apply_ok  = ok_apply;
       ESP_LOGI(TAG, "FOTA finalize: verify=%d apply(reboot)=%d", ok_verify?1:0, ok_apply?1:0);
+    } else {
+      // Check if this was a verification failure (corruption)
+      fota::FotaStatus status = fota::get_current_status();
+      if (status == fota::FotaStatus::VERIFY_FAILED) {
+        std::string failed_ver = fota::get_failed_version();
+        if (!failed_ver.empty()) {
+          g_fota_failure.has = true;
+          g_fota_failure.reason = "corruption_detected";
+          g_fota_failure.version = failed_ver;
+          log_event(("fota_corruption:" + failed_ver).c_str());
+          ESP_LOGE(TAG, "FOTA FAILURE: Image corruption detected for version %s. Rollback to previous version.",
+                   failed_ver.c_str());
+        }
+      }
     }
 
     // Execute staged command now; report in next slot

@@ -55,3 +55,6 @@ Thumbs.db
 .env.*
 *.pem
 *.key
+
+
+server/logs

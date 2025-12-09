@@ -50,7 +50,14 @@ The server (`server/app.py`) handles data uploads from devices and serves FOTA u
    ```
    pip install -r requirements.txt
    ```
-
+   #Run
+   ```
+   $env:SIM_KEY_B64 = "api_key"
+   $env:AUTH_KEYS_B64 = "dXNlcjpwYXNz"
+   # HMAC envelope (matches the PSK you set in menuconfig)
+   $env:PSK   = "ecowatt-demo-psk"
+   $env:USE_B64 = "1"  
+   ```
 3. Prepare the firmware binary for FOTA by running the following commands in PowerShell (one-time setup) in server folder:
 
    ```powershell
@@ -58,9 +65,9 @@ The server (`server/app.py`) handles data uploads from devices and serves FOTA u
    New-Item -ItemType Directory .\logs | Out-Null
 
    $logs  = "$PWD\logs"
-   $bin   = "D:\sem 07\Embedded\Ecowatt_Polaris\build\EcoWatt.bin"  
+   $bin   = "$PWD\..\build\EcoWatt.bin"  
    $chunk = 8192
-   $ver   = "1.0.6"   # bump version to force a fresh session
+   $ver   = "1.0.7"   # bump version to force a fresh session
    $bytes = [IO.File]::ReadAllBytes($bin)
    $size  = $bytes.Length
    $hash  = (Get-FileHash -Algorithm SHA256 $bin).Hash.ToLower()
@@ -143,3 +150,7 @@ EcoWatt/
 - Ensure the binary path in the PowerShell script matches your build output.
 - Update the version in the script for new firmware releases.
 - The server uses SQLite for data storage (`ecowatt.db`).
+
+
+
+

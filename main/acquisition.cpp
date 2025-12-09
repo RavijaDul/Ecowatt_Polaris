@@ -8,6 +8,9 @@
 
 using transport::post_frame;
 
+// External callback for SIM fault reporting
+extern "C" void sim_fault_notify(const char* fault_type, uint8_t exception_code, const char* description);
+
 namespace acquisition {
 
 static const char* TAG = "acq";
@@ -20,18 +23,28 @@ bool Acquisition::read_group(uint16_t addr, uint16_t count, std::vector<uint16_t
   out_regs.clear();
   std::string req  = modbus::make_read_holding(SLAVE, addr, count);
   std::string resp = post_frame("read", base_url_, api_key_, req);
-  if (resp.empty()) { ESP_LOGW(TAG, "Blank read response [addr=%u cnt=%u]", (unsigned)addr, (unsigned)count); return false; }
+  if (resp.empty()) { 
+    ESP_LOGW(TAG, "Blank read response [addr=%u cnt=%u]", (unsigned)addr, (unsigned)count);
+    sim_fault_notify("timeout", 0, "No response from SIM");
+    return false; 
+  }
   uint8_t slave = 0, func = 0;
   if (!modbus::parse_read_response(resp, slave, func, out_regs)) {
     uint8_t exc = 0, s = 0, f = 0;
     if (modbus::parse_exception_response(resp, s, f, exc)) {
       ESP_LOGW(TAG, "Modbus exception 0x%02X (%s) [addr=%u cnt=%u]", exc, modbus::exception_name(exc), (unsigned)addr, (unsigned)count);
+      sim_fault_notify("exception", exc, modbus::exception_name(exc));
     } else {
       ESP_LOGW(TAG, "Malformed/CRC error [addr=%u cnt=%u] payload=%s", (unsigned)addr, (unsigned)count, resp.c_str());
+      sim_fault_notify("malformed_response", 0, "CRC or parse error");
     }
     return false;
   }
-  if (slave != SLAVE || func != 0x03) { ESP_LOGW(TAG, "Unexpected header slave=0x%02X func=0x%02X", slave, func); return false; }
+  if (slave != SLAVE || func != 0x03) { 
+    ESP_LOGW(TAG, "Unexpected header slave=0x%02X func=0x%02X", slave, func); 
+    sim_fault_notify("malformed_response", 0, "Unexpected header");
+    return false; 
+  }
   return true;
 }
 
@@ -40,13 +53,19 @@ bool Acquisition::set_export_power(int percent, const std::string& reason_tag) {
   if (pct != percent) ESP_LOGW(TAG, "Export power clamped to %d from %d", pct, percent);
   std::string req  = modbus::make_write_single(SLAVE, 8, (uint16_t)pct);
   std::string resp = post_frame("write", base_url_, api_key_, req);
-  if (resp.empty()) { ESP_LOGW(TAG, "Write blank response (reason=%s)", reason_tag.c_str()); return false; }
+  if (resp.empty()) { 
+    ESP_LOGW(TAG, "Write blank response (reason=%s)", reason_tag.c_str());
+    sim_fault_notify("timeout", 0, "No write response");
+    return false; 
+  }
   if (resp != req) {
     uint8_t exc = 0, s = 0, f = 0;
     if (modbus::parse_exception_response(resp, s, f, exc)) {
       ESP_LOGW(TAG, "Write exception 0x%02X (%s)", exc, modbus::exception_name(exc));
+      sim_fault_notify("exception", exc, modbus::exception_name(exc));
     } else {
       ESP_LOGW(TAG, "Write echo mismatch: %s", resp.c_str());
+      sim_fault_notify("malformed_response", 0, "Echo mismatch");
     }
     return false;
   }

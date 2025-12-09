@@ -24,6 +24,9 @@ static constexpr const char* K_SZ = "mf.size";
 static constexpr const char* K_HASH="mf.hash";
 static constexpr const char* K_WR = "bytes_written";
 static constexpr const char* K_NEXT="next_chunk";
+static constexpr const char* K_LAST_FAILED_VER = "last_failed_ver";  // track last failed version
+static constexpr const char* K_STATUS = "status";  // current FOTA status
+
 // Global C-linkage progress callback implemented in main.cpp
 extern "C" void fota_progress_notify(uint32_t written, uint32_t total);
 
@@ -37,6 +40,8 @@ struct State {
   uint32_t   next_chunk = 0;             // expected chunk_number (optional)
   bool       finalize_requested = false;  // true once size reached
   bool       finalized = false;
+  fota::FotaStatus status = fota::FotaStatus::IDLE;  // track current status
+  std::string failed_version = "";  // version that failed verification
 
   // Hash (streaming)
   mbedtls_sha256_context sha;
@@ -292,6 +297,8 @@ bool finalize_and_apply(bool& ok_verify, bool& ok_apply) {
   if (!hex2bin(S.mf.hash_hex, want)) {
     ESP_LOGE(TAG, "Bad manifest hash format");
     S.last_error="bad-hash-format";
+    S.status = fota::FotaStatus::VERIFY_FAILED;
+    S.failed_version = S.mf.version;
     return false;
   }
   ok_verify = (memcmp(sha_out, want, 32)==0);
@@ -301,13 +308,18 @@ bool finalize_and_apply(bool& ok_verify, bool& ok_apply) {
   if (er != ESP_OK) {
     ESP_LOGE(TAG, "esp_ota_end failed: %s", esp_err_to_name(er));
     S.last_error = "ota-end";
+    S.status = fota::FotaStatus::VERIFY_FAILED;
+    S.failed_version = S.mf.version;
     return false;
   }
 
   if (!ok_verify) {
-    ESP_LOGE(TAG, "SHA256 mismatch — keeping current app, not switching.");
+    ESP_LOGE(TAG, "SHA256 mismatch — IMAGE CORRUPTION DETECTED. Keeping current app, not switching. Failed version=%s", S.mf.version.c_str());
     S.finalized = true;
+    S.status = fota::FotaStatus::VERIFY_FAILED;  // Mark as verification failure
+    S.failed_version = S.mf.version;  // Store failed version for cloud reporting
     nvstore::set_u64(NS, K_WR,0); nvstore::set_u64(NS, K_NEXT,0);
+    nvstore::set_str(NS, K_LAST_FAILED_VER, S.mf.version);  // Persist failed version
     return false; // no reboot
   }
 
@@ -315,13 +327,18 @@ bool finalize_and_apply(bool& ok_verify, bool& ok_apply) {
   er = esp_ota_set_boot_partition(S.part);
   if (er == ESP_OK) {
     ok_apply = true;
+    S.status = fota::FotaStatus::VERIFY_OK;
     ESP_LOGI(TAG, "FOTA finalize success: verified & boot partition set. Rebooting...");
     S.finalized = true;
     nvstore::set_u64(NS, K_WR,0); nvstore::set_u64(NS, K_NEXT,0);
+    nvstore::set_str(NS, K_STATUS, "verify_ok");  // Mark in NVS before reboot
     esp_restart();
   } else {
     ESP_LOGE(TAG, "esp_ota_set_boot_partition failed: %s", esp_err_to_name(er));
     S.last_error = "set-boot";
+    S.status = fota::FotaStatus::VERIFY_FAILED;
+    S.failed_version = S.mf.version;
+    nvstore::set_str(NS, K_LAST_FAILED_VER, S.mf.version);
   }
   return ok_verify && ok_apply;
 }
@@ -349,6 +366,14 @@ std::string status_json(){
     S.finalized ? "true":"false",
     S.last_error.c_str());
   return std::string(buf);
+}
+
+FotaStatus get_current_status() {
+  return S.status;
+}
+
+std::string get_failed_version() {
+  return S.failed_version;
 }
 
 } // namespace fota
