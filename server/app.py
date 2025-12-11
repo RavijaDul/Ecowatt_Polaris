@@ -1027,6 +1027,7 @@ def admin_fota():
       const chunkInput = document.getElementById('fota-chunk');
       const statusSpan = document.getElementById('upload-status');
       const resultDiv = document.getElementById('upload-result');
+      const resultText = document.getElementById('result-text');
       
       if (!fileInput.files.length) {
         statusSpan.textContent = '❌ Please select a file';
@@ -1273,6 +1274,7 @@ def admin_fota_upload():
       const chunkInput = document.getElementById('fota-chunk');
       const statusSpan = document.getElementById('upload-status');
       const resultDiv = document.getElementById('upload-result');
+      const resultContent = document.getElementById('result-content');
       const progressContainer = document.getElementById('progress-container');
       const progressBar = document.getElementById('progress-bar');
       const progressText = document.getElementById('progress-text');
