@@ -13,16 +13,19 @@ idf_component_register(
     "nvstore.cpp"
     "control.cpp"
     "fota.cpp"
-  INCLUDE_DIRS "."
+  INCLUDE_DIRS
+    "."
   REQUIRES
-    app_update
+    app_update         
     esp_http_client
     esp_wifi
     esp_event
-    esp_netif
+    esp_netif          
     nvs_flash
     esp_timer
+    freertos
     mbedtls
+    esp_pm
 )
 
 target_compile_features(${COMPONENT_LIB} PUBLIC cxx_std_17)

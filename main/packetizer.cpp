@@ -18,6 +18,10 @@ static inline bool is_https(const std::string& url) { return url.rfind("https://
 namespace uplink {
 static const char* TAG="uplink";
 
+static uint8_t upload_retry_count = 3;
+static uint32_t upload_backoff_base_ms = 1000;
+static uint32_t upload_backoff_max_ms = 4000;
+
 static std::string b64(const std::string& bin){
   size_t out_len=0; mbedtls_base64_encode(nullptr,0,&out_len,(const unsigned char*)bin.data(),bin.size());
   std::string out; out.resize(out_len);
@@ -107,12 +111,31 @@ bool post_payload_and_get_reply(const std::string& base_url,
   if(!api_key_b64.empty()) esp_http_client_set_header(cli, "Authorization", api_key_b64.c_str());
   esp_http_client_set_header(cli, "Content-Type", "application/json");
   esp_http_client_set_post_field(cli, json_body.c_str(), json_body.size());
-  esp_err_t e = esp_http_client_perform(cli);
-  int code = (e==ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
-  bool ok = (e==ESP_OK && code>=200 && code<300);
-  if(ok) out_reply_body.swap(rb.data);
+  std::string last_body;
+  esp_err_t last_err = ESP_FAIL; int last_code = -1;
+  for (uint8_t attempt=0; attempt<upload_retry_count; ++attempt) {
+    rb.data.clear();
+    last_err = esp_http_client_perform(cli);
+    last_code = (last_err==ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
+    last_body = rb.data;
+    if (last_err==ESP_OK && last_code>=200 && last_code<300 && !last_body.empty()) break;
+    ESP_LOGW(TAG, "upload attempt=%u err=%s code=%d body_len=%d", (unsigned)attempt+1, esp_err_to_name(last_err), last_code, (int)rb.data.size());
+    if (attempt+1 < upload_retry_count) {
+      uint32_t delay_ms = upload_backoff_base_ms << attempt;
+      if (delay_ms > upload_backoff_max_ms) delay_ms = upload_backoff_max_ms;
+      vTaskDelay(pdMS_TO_TICKS(delay_ms));
+    }
+  }
+  bool ok = (last_err==ESP_OK && last_code>=200 && last_code<300 && !last_body.empty());
+  if(ok) out_reply_body.swap(last_body);
   esp_http_client_cleanup(cli);
   return ok;
+}
+
+void set_retry_policy(uint8_t retries, uint32_t base_backoff_ms, uint32_t max_backoff_ms){
+  upload_retry_count = (retries>0)?retries:1;
+  upload_backoff_base_ms = (base_backoff_ms>0)?base_backoff_ms:1000;
+  upload_backoff_max_ms = (max_backoff_ms>0)?max_backoff_ms:4000;
 }
 
 } // namespace uplink

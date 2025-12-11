@@ -1,0 +1,22 @@
+# Optimized SDK config (power optimizations ON, aggressive)
+# Copy this to `sdkconfig` before building: copy configs\optimized.sdkconfig sdkconfig
+
+CONFIG_ECOWATT_DEVICE_ID="EcoWatt-Dev-01-opt"
+# Enable automatic PM-managed light-sleep
+CONFIG_ECOWATT_ENABLE_AUTO_LIGHT_SLEEP=y
+# Allow manual light-sleep code paths (eco_light_sleep_until) as well
+CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP=y
+# Enable Wi-Fi gating between uploads (only recommended with long upload intervals)
+CONFIG_ECOWATT_WIFI_GATE_BETWEEN_UPLOADS=y
+CONFIG_ECOWATT_WIFI_GATE_MIN_INTERVAL_SEC=30
+# Use a long upload interval to amortize wake/handshake costs
+CONFIG_ECOWATT_UPLOAD_INTERVAL_SEC=900
+# Keep sampling period as needed (could be same as baseline or larger)
+CONFIG_ECOWATT_SAMPLE_PERIOD_MS=5000
+CONFIG_ECOWATT_WIFI_PS_MODE=1
+
+# Energy estimation defaults (can be adjusted)
+CONFIG_ECOWATT_POWER_V_SUPPLY=5000
+CONFIG_ECOWATT_POWER_I_ACTIVE_MA=200
+CONFIG_ECOWATT_POWER_I_UPLINK_MA=300
+CONFIG_ECOWATT_POWER_I_SLEEP_MA=5

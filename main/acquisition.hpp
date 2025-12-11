@@ -31,4 +31,7 @@ private:
   std::string api_key_;
 };
 
+// External callback for SIM fault reporting (implemented in main.cpp)
+extern "C" void sim_fault_notify(const char* fault_type, uint8_t exception_code, const char* description);
+
 } // namespace acquisition

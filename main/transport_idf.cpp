@@ -2,6 +2,8 @@
 #include <string>
 #include "esp_http_client.h"
 #include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #if __has_include("esp_crt_bundle.h")
 #include "esp_crt_bundle.h"
 #define USE_CRT_BUNDLE 1
@@ -20,6 +22,10 @@ static inline bool is_https(const std::string& url) {
 }
 
 struct RespBuf { std::string data; };
+static uint32_t conn_failures = 0;
+static uint8_t retry_count = 3;
+static uint32_t backoff_base_ms = 200;
+static uint32_t backoff_max_ms = 2000;
 static esp_err_t http_evt(esp_http_client_event_t* e) {
   if (!e || !e->user_data) return ESP_OK;
   auto* buf = static_cast<RespBuf*>(e->user_data);
@@ -61,15 +67,28 @@ std::string post_frame(const std::string& kind,
   if (!api_key_b64.empty()) esp_http_client_set_header(cli, "Authorization", api_key_b64.c_str());
   esp_http_client_set_post_field(cli, body.c_str(), body.size());
 
-  esp_err_t err = esp_http_client_perform(cli);
-  int code = (err==ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
-  if (err != ESP_OK || code != 200 || rb.data.empty()) {
-    ESP_LOGW(TAG, "%s HTTP err=%s code=%d body_len=%d", kind.c_str(), esp_err_to_name(err), code, (int)rb.data.size());
+  std::string last_body;
+  int last_code = -1;
+  esp_err_t last_err = ESP_FAIL;
+  for (uint8_t attempt = 0; attempt < retry_count; ++attempt) {
+    rb.data.clear();
+    last_err = esp_http_client_perform(cli);
+    last_code = (last_err==ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
+    last_body = rb.data;
+    if (last_err == ESP_OK && last_code == 200 && !rb.data.empty()) break;
+    ++conn_failures;
+    ESP_LOGW(TAG, "%s HTTP attempt=%u err=%s code=%d body_len=%d", kind.c_str(), (unsigned)attempt+1, esp_err_to_name(last_err), last_code, (int)rb.data.size());
+    // backoff before next try
+    uint32_t delay_ms = backoff_base_ms << attempt;
+    if (delay_ms > backoff_max_ms) delay_ms = backoff_max_ms;
+    vTaskDelay(pdMS_TO_TICKS(delay_ms));
+  }
+  if (last_err != ESP_OK || last_code != 200 || last_body.empty()) {
     esp_http_client_cleanup(cli);
     return {};
   }
   esp_http_client_cleanup(cli);
-  std::string frame = extract_frame_field(rb.data);
+  std::string frame = extract_frame_field(last_body);
   if (frame.empty()) {
     ESP_LOGW(TAG, "No 'frame' in JSON reply");
     return {};
@@ -77,4 +96,11 @@ std::string post_frame(const std::string& kind,
   return frame;
 }
 
+uint32_t get_conn_failures(){ return conn_failures; }
+
+void set_retry_policy(uint8_t retries, uint32_t base_backoff_ms, uint32_t max_backoff_ms){
+  retry_count = retries > 0 ? retries : 1;
+  backoff_base_ms = base_backoff_ms > 0 ? base_backoff_ms : 200;
+  backoff_max_ms = max_backoff_ms > 0 ? max_backoff_ms : 2000;
+}
 } // namespace transport

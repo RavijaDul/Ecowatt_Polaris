@@ -21,4 +21,7 @@ bool post_payload_and_get_reply(const std::string& cloud_base_url,
                                 const std::string& json_body,
                                 std::string& out_reply_body);
 
+// Configure retry/backoff used for cloud uploads
+void set_retry_policy(uint8_t retries, uint32_t base_backoff_ms, uint32_t max_backoff_ms);
+
 } // namespace uplink
