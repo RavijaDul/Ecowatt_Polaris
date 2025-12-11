@@ -74,6 +74,8 @@ CREATE TABLE IF NOT EXISTS power_stats (
   device        TEXT    NOT NULL,
   received_at   INTEGER NOT NULL,
   t_sleep_ms    INTEGER NOT NULL,
+  t_manual_sleep_ms INTEGER DEFAULT 0,
+  t_auto_sleep_ms   INTEGER DEFAULT 0,
   idle_budget_ms INTEGER NOT NULL,
   t_uplink_ms   INTEGER NOT NULL,
   uplink_bytes  INTEGER NOT NULL
@@ -659,17 +661,19 @@ def device_upload():
     ps = body.get("power_stats")
     if isinstance(ps, dict):
         try:
-            t_sleep  = int(ps.get("t_sleep_ms") or 0)          # will be 0 with our approach
+            t_sleep  = int(ps.get("t_sleep_ms") or 0)          # total sleep (manual + auto)
+            t_manual = int(ps.get("t_manual_sleep_ms") or 0)   # manual light-sleep
+            t_auto   = int(ps.get("t_auto_sleep_ms") or 0)     # auto light-sleep (estimated)
             t_uplink = int(ps.get("t_uplink_ms") or 0)
             ubytes   = int(ps.get("uplink_bytes") or 0)
             idle_b   = int(ps.get("idle_budget_ms") or 0)
             db = get_db()
             db.execute(
-                "INSERT INTO power_stats(device, received_at, t_sleep_ms, t_uplink_ms, uplink_bytes, idle_budget_ms) VALUES(?,?,?,?,?,?)",
-                (dev, now_ms, t_sleep, t_uplink, ubytes, idle_b)
+                "INSERT INTO power_stats(device, received_at, t_sleep_ms, t_manual_sleep_ms, t_auto_sleep_ms, t_uplink_ms, uplink_bytes, idle_budget_ms) VALUES(?,?,?,?,?,?,?,?)",
+                (dev, now_ms, t_sleep, t_manual, t_auto, t_uplink, ubytes, idle_b)
             )
             db.commit()
-            print(f"[PWR] dev={dev} idle={idle_b}ms uplink={t_uplink}ms bytes={ubytes}", flush=True)
+            print(f"[PWR] dev={dev} idle={idle_b}ms sleep={t_sleep}ms (manual={t_manual}ms auto={t_auto}ms) uplink={t_uplink}ms bytes={ubytes}", flush=True)
         except Exception as e:
             print(f"[PWR] insert error: {e}", flush=True)
 
@@ -1023,7 +1027,6 @@ def admin_fota():
       const chunkInput = document.getElementById('fota-chunk');
       const statusSpan = document.getElementById('upload-status');
       const resultDiv = document.getElementById('upload-result');
-      const resultText = document.getElementById('result-text');
       
       if (!fileInput.files.length) {
         statusSpan.textContent = '❌ Please select a file';
@@ -1876,7 +1879,7 @@ def admin_power():
 def admin_power_device(device: str):
     db = get_db()
     rows = db.execute("""
-        SELECT received_at,idle_budget_ms,  t_sleep_ms, t_uplink_ms, uplink_bytes
+        SELECT received_at,idle_budget_ms, t_sleep_ms, t_uplink_ms, uplink_bytes
         FROM power_stats
         WHERE device=?
         ORDER BY received_at DESC
@@ -1900,6 +1903,8 @@ def api_power_summary():
             COUNT(*)               AS n,
             AVG(idle_budget_ms)    AS avg_idle_ms,
             AVG(t_sleep_ms)        AS avg_sleep_ms,
+            AVG(t_manual_sleep_ms) AS avg_manual_sleep_ms,
+            AVG(t_auto_sleep_ms)   AS avg_auto_sleep_ms,
             AVG(t_uplink_ms)       AS avg_uplink_ms,
             AVG(uplink_bytes)      AS avg_bytes,
             MAX(received_at)       AS last_recv
@@ -1910,8 +1915,8 @@ def api_power_summary():
 
     return jsonify([
         {"device": r[0], "samples": r[1], "avg_idle_ms": r[2],
-        "avg_sleep_ms": r[3], "avg_uplink_ms": r[4],
-        "avg_bytes": r[5], "last_received_ms": r[6]}
+        "avg_sleep_ms": r[3], "avg_manual_sleep_ms": r[4], "avg_auto_sleep_ms": r[5],
+        "avg_uplink_ms": r[6], "avg_bytes": r[7], "last_received_ms": r[8]}
         for r in rows
     ])
 
@@ -1919,7 +1924,7 @@ def api_power_summary():
 def api_power_device(device: str):
     db = get_db()
     rows = db.execute("""
-        SELECT received_at, idle_budget_ms, t_sleep_ms, t_uplink_ms, uplink_bytes
+        SELECT received_at, idle_budget_ms, t_sleep_ms, t_manual_sleep_ms, t_auto_sleep_ms, t_uplink_ms, uplink_bytes
         FROM power_stats
         WHERE device=?
         ORDER BY received_at DESC
@@ -1928,7 +1933,8 @@ def api_power_device(device: str):
 
     return jsonify([
         {"received_at_ms": r[0], "idle_budget_ms": r[1],
-        "t_sleep_ms": r[2], "t_uplink_ms": r[3], "uplink_bytes": r[4]}
+        "t_sleep_ms": r[2], "t_manual_sleep_ms": r[3], "t_auto_sleep_ms": r[4],
+        "t_uplink_ms": r[5], "uplink_bytes": r[6]}
         for r in rows
     ])
 
@@ -1947,14 +1953,15 @@ def api_power_snapshot():
     cutoff = now_ms_val - (minutes * 60 * 1000)
     db = get_db()
     rows = db.execute("""
-        SELECT received_at, idle_budget_ms, t_sleep_ms, t_uplink_ms, uplink_bytes
+        SELECT received_at, idle_budget_ms, t_sleep_ms, t_manual_sleep_ms, t_auto_sleep_ms, t_uplink_ms, uplink_bytes
         FROM power_stats
         WHERE device=? AND received_at>=?
         ORDER BY received_at DESC
         LIMIT ?
     """, (dev, cutoff, max_samples)).fetchall()
     data = [
-        {"received_at_ms": r[0], "idle_budget_ms": r[1], "t_sleep_ms": r[2], "t_uplink_ms": r[3], "uplink_bytes": r[4]}
+        {"received_at_ms": r[0], "idle_budget_ms": r[1], "t_sleep_ms": r[2], 
+         "t_manual_sleep_ms": r[3], "t_auto_sleep_ms": r[4], "t_uplink_ms": r[5], "uplink_bytes": r[6]}
         for r in rows
     ]
     pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
@@ -1969,9 +1976,9 @@ def api_power_snapshot():
     try:
         with open(csv_path, "w", newline='') as cf:
             w = csv.writer(cf)
-            w.writerow(["received_at_ms", "idle_budget_ms", "t_sleep_ms", "t_uplink_ms", "uplink_bytes"])
+            w.writerow(["received_at_ms", "idle_budget_ms", "t_sleep_ms", "t_manual_sleep_ms", "t_auto_sleep_ms", "t_uplink_ms", "uplink_bytes"])
             for r in data:
-                w.writerow([r['received_at_ms'], r['idle_budget_ms'], r['t_sleep_ms'], r['t_uplink_ms'], r['uplink_bytes']])
+                w.writerow([r['received_at_ms'], r['idle_budget_ms'], r['t_sleep_ms'], r['t_manual_sleep_ms'], r['t_auto_sleep_ms'], r['t_uplink_ms'], r['uplink_bytes']])
     except Exception as e:
         return jsonify({"ok": False, "error": "csv_write_failed", "detail": str(e)}), 500
     # create PNG plot
@@ -2120,12 +2127,32 @@ def admin_controls():
     {"<p><b>"+ok+"</b></p>" if ok else ""}
 
     <h3>Config update</h3>
-    <form method="post">
-      <input type="hidden" name="kind" value="config">
-      <label>Sampling interval (sec): <input name="sampling_interval" type="number" min="1" value="5"></label><br>
-      <label>Registers (comma): <input name="registers" type="text" placeholder="vac1,iac1,fac1"></label><br>
-      <button type="submit">Queue config_update</button>
-    </form>
+        <form method="post" onsubmit="return submitRegisters();">
+            <input type="hidden" name="kind" value="config">
+            <label>Sampling interval (sec): <input name="sampling_interval" type="number" min="1" value="5"></label><br>
+            <label>Registers:</label>
+            <div style="display:flex;gap:16px;flex-wrap:wrap;margin-bottom:8px;">
+                <!-- List of registers as checkboxes -->
+                <label><input type="checkbox" name="reg" value="vac1" checked> vac1</label>
+                <label><input type="checkbox" name="reg" value="iac1" checked> iac1</label>
+                <label><input type="checkbox" name="reg" value="fac1" checked> fac1</label>
+                <label><input type="checkbox" name="reg" value="vpv1" checked> vpv1</label>
+                <label><input type="checkbox" name="reg" value="vpv2" checked> vpv2</label>
+                <label><input type="checkbox" name="reg" value="ipv1" checked> ipv1</label>
+                <label><input type="checkbox" name="reg" value="ipv2" checked> ipv2</label>
+                <label><input type="checkbox" name="reg" value="temp" checked> temp</label>
+                <label><input type="checkbox" name="reg" value="pac" checked> pac</label>
+            </div>
+            <input type="hidden" name="registers" id="registers_hidden">
+            <button type="submit">Queue config_update</button>
+        </form>
+        <script>
+        function submitRegisters() {{
+            var regs = Array.from(document.querySelectorAll('input[name="reg"]:checked')).map(function(cb){{return cb.value;}});
+            document.getElementById('registers_hidden').value = regs.join(',');
+            return true;
+        }}
+        </script>
 
     <h3>Command (export power %)</h3>
     <form method="post">

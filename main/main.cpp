@@ -75,6 +75,10 @@
 #define CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP 0
 #endif
 
+#ifndef CONFIG_ECOWATT_ENABLE_AUTO_LIGHT_SLEEP
+#define CONFIG_ECOWATT_ENABLE_AUTO_LIGHT_SLEEP 0
+#endif
+
 // =========================================================
 #include <cstdio>   
 #include <cstdlib> 
@@ -115,9 +119,13 @@
 static const char* TAG = "main";
 
 static EventGroupHandle_t s_evt;
+
 static constexpr int BIT_CONNECTED = BIT0;
 static constexpr int BIT_GOT_IP    = BIT1;
 static constexpr int BIT_NTP_OK    = BIT2;
+
+
+
 
 static buffer::Ring* g_ring = nullptr;
 static SemaphoreHandle_t g_ring_mtx = nullptr;
@@ -126,10 +134,16 @@ static int64_t s_epoch_offset_ms = 0;
 static inline uint64_t monotonic_ms(){ return (uint64_t)esp_timer_get_time() / 1000ULL; }
 static inline uint64_t now_ms_epoch(){ return (uint64_t)((int64_t)monotonic_ms() + s_epoch_offset_ms); }
 
+
 // Runtime config/command/FOTA
 static control::RuntimeConfig g_cfg_cur{}; 
 static control::RuntimeConfig g_cfg_next{};
 static bool g_has_pending_cfg = false;
+
+// Helper to check if sleep features should be enabled
+static inline bool sleep_features_enabled() {
+  return (g_cfg_cur.sampling_interval_ms >= CONFIG_ECOWATT_SLEEP_FEATURE_THRESHOLD_MS);
+}
 
 // NEW (M4): one-shot config_ack to merge into next payload
 static std::string g_cfg_ack_json;
@@ -172,10 +186,12 @@ struct {
 
 // --- Power instrumentation ---
 struct power_stats_t {
-  uint64_t t_sleep_ms  = 0;
+  uint64_t t_sleep_ms  = 0;       // manual light-sleep time
+  uint64_t t_auto_sleep_us = 0;  // auto light-sleep time (from PM)
   uint64_t t_uplink_ms = 0;
   uint32_t uplink_bytes = 0;
 } g_pwr;
+
 
 // ---- Fault/event log (cleared after each successful upload) ----
 static std::vector<std::string> g_events;
@@ -345,12 +361,14 @@ static void task_acq(void*){
 
   // inside task_acq loop, after work_ms computed
   #if CONFIG_ECOWATT_MANUAL_LIGHT_SLEEP
-    const uint32_t safe_min_sleep_ms = 50; // minimal useful sleep (tune with measurements)
-    uint64_t next_tick_ms = loop_start_ms + (uint64_t)period_ms;
-    uint64_t now = now_ms();
-    if (next_tick_ms > now + CONFIG_ECOWATT_SLEEP_MARGIN_MS + safe_min_sleep_ms) {
-      eco_light_sleep_until(next_tick_ms);
-    } // else skip sleeping because window too small
+    if (sleep_features_enabled()) {
+      const uint32_t safe_min_sleep_ms = 50; // minimal useful sleep (tune with measurements)
+      uint64_t next_tick_ms = loop_start_ms + (uint64_t)period_ms;
+      uint64_t now = now_ms();
+      if (next_tick_ms > now + CONFIG_ECOWATT_SLEEP_MARGIN_MS + safe_min_sleep_ms) {
+        eco_light_sleep_until(next_tick_ms);
+      } // else skip sleeping because window too small
+    }
   #endif
     vTaskDelayUntil(&last, period_ticks);
 
@@ -477,19 +495,43 @@ static void task_uplink(void*){
         }
       }
     }
+    // Estimate auto-sleep time: when auto light-sleep is enabled, the PM automatically
+    // sleeps during idle periods. We can estimate this as (idle_budget - manual_sleep - uplink).
+    // This is an approximation since some idle time may be spent in frequency scaling rather than sleep.
+    #if CONFIG_ECOWATT_ENABLE_AUTO_LIGHT_SLEEP
+    {
+      // Auto-sleep happens during idle periods when not manually sleeping
+      // A reasonable estimate: idle_budget represents available sleep window,
+      // manual_sleep is what we explicitly slept, the rest is handled by PM auto-sleep
+      // Note: This is a heuristic; actual auto-sleep may be less due to interrupts
+      if (g_idle_budget_ms > g_pwr.t_sleep_ms) {
+        // Estimate ~70% of remaining idle time was spent in auto light-sleep
+        // (the rest is task switching, frequency scaling, interrupt handling)
+        uint64_t remaining_idle_ms = g_idle_budget_ms - g_pwr.t_sleep_ms;
+        g_pwr.t_auto_sleep_us = remaining_idle_ms * 700ULL;  // 70% in microseconds
+      }
+    }
+    #endif
+
     // Append power stats (rolling) into the payload root
     {
       if (body_json.back()=='}') {
-        char buf[192];
+        // Combine manual + auto sleep time into total sleep
+        uint64_t total_sleep_ms = g_pwr.t_sleep_ms + (g_pwr.t_auto_sleep_us / 1000ULL);
+        char buf[256];
         snprintf(buf, sizeof(buf),
           ",\"power_stats\":{"
             "\"idle_budget_ms\":%" PRIu64 ","
             "\"t_sleep_ms\":%" PRIu64 ","
+            "\"t_manual_sleep_ms\":%" PRIu64 ","
+            "\"t_auto_sleep_ms\":%" PRIu64 ","
             "\"t_uplink_ms\":%" PRIu64 ","
             "\"uplink_bytes\":%u"
           "}",
           (unsigned long long)g_idle_budget_ms,
+          (unsigned long long)total_sleep_ms,
           (unsigned long long)g_pwr.t_sleep_ms,
+          (unsigned long long)(g_pwr.t_auto_sleep_us / 1000ULL),
           (unsigned long long)g_pwr.t_uplink_ms,
           (unsigned)g_pwr.uplink_bytes);
         body_json.pop_back(); body_json += buf; body_json += "}";
@@ -769,9 +811,13 @@ extern "C" void app_main(void) {
   esp_pm_config_t pmcfg = {
     .max_freq_mhz = CONFIG_ECOWATT_PM_MAX_FREQ_MHZ,
     .min_freq_mhz = CONFIG_ECOWATT_PM_MIN_FREQ_MHZ,
-    .light_sleep_enable = false
+    .light_sleep_enable = (bool)(sleep_features_enabled() && CONFIG_ECOWATT_ENABLE_AUTO_LIGHT_SLEEP)
   };
   ESP_ERROR_CHECK(esp_pm_configure(&pmcfg));
+  ESP_LOGI(TAG, "PM configured: max=%uMHz min=%uMHz auto_sleep=%s (threshold=%u, actual=%u)",
+           (unsigned)CONFIG_ECOWATT_PM_MAX_FREQ_MHZ, (unsigned)CONFIG_ECOWATT_PM_MIN_FREQ_MHZ,
+           (sleep_features_enabled() && CONFIG_ECOWATT_ENABLE_AUTO_LIGHT_SLEEP) ? "ON" : "OFF",
+           (unsigned)CONFIG_ECOWATT_SLEEP_FEATURE_THRESHOLD_MS, (unsigned)g_cfg_cur.sampling_interval_ms);
 
 
   wifi_start_and_wait_ip();

@@ -31,8 +31,13 @@ config ECOWATT_UPLOAD_INTERVAL_SEC
 
 config ECOWATT_SAMPLE_PERIOD_MS
     int "Sampling period (ms)"
-    range 100 60000
+    range 100 90000
     default 5000
+
+config ECOWATT_SLEEP_FEATURE_THRESHOLD_MS
+    int "Minimum sample period (ms) to enable sleep features"
+    range 100 900000
+    default 90000
 
 config ECOWATT_DEVICE_ID
     string "Device ID"
@@ -48,11 +53,11 @@ config ECOWATT_USE_ENVELOPE
 
 config ECOWATT_MANUAL_LIGHT_SLEEP
     bool "Allow manual light-sleep between sampling ticks"
-    default n
+    default y
 
 config ECOWATT_ENABLE_AUTO_LIGHT_SLEEP
     bool "Enable automatic light-sleep via ESP power manager"
-    default n
+    default y
 
 config ECOWATT_SAFE_MIN_SLEEP_MS
     int "Safe minimal sleep window (ms) for manual light-sleep"
