@@ -14,6 +14,8 @@
 #include <algorithm>
 #include <mbedtls/sha256.h>
 #include <mbedtls/base64.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
 
 namespace {
 
@@ -51,6 +53,15 @@ struct State {
   std::string last_error;
 } S;
 
+// Mutex to protect State S across multiple FreeRTOS tasks
+static SemaphoreHandle_t s_mutex = nullptr;
+
+struct ScopedLock {
+  SemaphoreHandle_t m;
+  ScopedLock(SemaphoreHandle_t mm){ m = mm; if(m) xSemaphoreTake(m, portMAX_DELAY); }
+  ~ScopedLock(){ if(m) xSemaphoreGive(m); }
+};
+
 static const char* TAG = "fota";
 
 static std::string b64dec(const std::string& s){
@@ -86,17 +97,38 @@ static bool eq_hex_ci(const std::string& a, const std::string& b){
 
 uint32_t fota::get_next_chunk_for_cloud(){
   // No locking needed if only called from the same task; add a mutex if you later use multi-task access.
+  ScopedLock lock(s_mutex);
   return S.session_active ? S.next_chunk : 0u;
+}
+
+uint32_t fota::get_last_acked_chunk(){
+  // Returns the highest chunk number successfully ingested (S.next_chunk - 1)
+  // If session not active or no chunks yet, returns 0
+  ScopedLock lock(s_mutex);
+  if (!S.session_active || S.next_chunk == 0) return 0;
+  return S.next_chunk - 1;
+}
+
+bool fota::is_session_active(){
+  ScopedLock lock(s_mutex);
+  return S.session_active;
+}
+
+fota::Manifest fota::get_current_manifest(){
+  ScopedLock lock(s_mutex);
+  return S.mf;
 }
 
 namespace fota {
 
 void init(){
   nvstore::init(); // ensure NVS ready
+  if (s_mutex == nullptr) s_mutex = xSemaphoreCreateMutex();
 }
 
 // Begin a (possibly resumable) OTA session
 bool start(const Manifest& m){
+  ScopedLock lock(s_mutex);
   // If we already have an identical manifest persisted and OTA not finalized, resume.
   std::string old_ver, old_hash;
   uint64_t sz=0, wr=0, next=0;
@@ -211,6 +243,7 @@ bool start(const Manifest& m){
 
 // Accept a chunk (any time during the session)
 bool ingest_chunk(uint32_t number, const std::string& b64){
+  ScopedLock lock(s_mutex);
   if (!S.session_active || !S.sha_init || S.finalized) return false;
 
 
@@ -271,6 +304,7 @@ bool ingest_chunk(uint32_t number, const std::string& b64){
 // Returns true if it *completed an attempt* to finalize this cycle.
 bool finalize_and_apply(bool& ok_verify, bool& ok_apply) {
   ok_verify = false; ok_apply = false;
+  ScopedLock lock(s_mutex);
   if (!S.session_active || S.finalized) return false;
   if (!S.sha_init) return false;
   if (S.bytes_written != S.mf.size) return false;
@@ -316,6 +350,7 @@ bool finalize_and_apply(bool& ok_verify, bool& ok_apply) {
   if (!ok_verify) {
     ESP_LOGE(TAG, "SHA256 mismatch — IMAGE CORRUPTION DETECTED. Keeping current app, not switching. Failed version=%s", S.mf.version.c_str());
     S.finalized = true;
+    S.session_active = false;  // End FOTA session after verification failure
     S.status = fota::FotaStatus::VERIFY_FAILED;  // Mark as verification failure
     S.failed_version = S.mf.version;  // Store failed version for cloud reporting
     nvstore::set_u64(NS, K_WR,0); nvstore::set_u64(NS, K_NEXT,0);
@@ -345,6 +380,7 @@ bool finalize_and_apply(bool& ok_verify, bool& ok_apply) {
 
 std::string status_json(){
   // Progress & last_error are handy for cloud logs/UI
+  ScopedLock lock(s_mutex);
   char buf[192];
   snprintf(buf, sizeof(buf),
     "{\"fota_status\":{"
@@ -369,10 +405,12 @@ std::string status_json(){
 }
 
 FotaStatus get_current_status() {
+  ScopedLock lock(s_mutex);
   return S.status;
 }
 
 std::string get_failed_version() {
+  ScopedLock lock(s_mutex);
   return S.failed_version;
 }
 

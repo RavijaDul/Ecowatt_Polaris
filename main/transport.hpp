@@ -9,6 +9,11 @@ std::string post_frame(const std::string& kind,
                        const std::string& api_key_b64,
                        const std::string& frame_hex);
 
+// FOTA: GET a chunk independently (returns JSON with "data" field or error)
+std::string get_fota_chunk(const std::string& base_url,
+                           const std::string& device_id,
+                           uint32_t chunk_number);
+
 // Get number of connection/perform failures observed since boot
 uint32_t get_conn_failures();
 

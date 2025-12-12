@@ -421,15 +421,31 @@ static void task_uplink(void*){
       ESP_LOGI(TAG, "upload: no samples");
     }
 
-    // Add FOTA status if present
-    if (g_fota_progress.has) {
+    // Add running firmware version for FOTA detection
+    {
+      esp_app_desc_t app_desc;
+      const esp_partition_t* running_partition = esp_ota_get_running_partition();
+      if (running_partition && esp_ota_get_partition_description(running_partition, &app_desc) == ESP_OK) {
+        char ver_buf[64];
+        snprintf(ver_buf, sizeof(ver_buf), ",\"fw_version\":\"%s\"", app_desc.version);
+        if (body_json.back()=='}') { body_json.pop_back(); body_json += ver_buf; body_json += "}"; }
+      }
+    }
+
+    // Add FOTA status: only send during active download (not finalized, not idle)
+    // Check if there's an active incomplete FOTA session
+    uint32_t next_chunk = fota::get_next_chunk_for_cloud();
+    uint32_t acked_chunk = fota::get_last_acked_chunk();
+    bool fota_active = (next_chunk > 0 || acked_chunk > 0) && g_fota_progress.has;
+    
+    if (fota_active) {
       uint32_t pct = (g_fota_progress.total>0)
                     ? (uint32_t)((100ULL*g_fota_progress.written)/g_fota_progress.total)
                     : 0;
       char buf[96];
       snprintf(buf, sizeof(buf),
-        ",\"fota\":{\"progress\":%lu,\"next_chunk\":%lu}",
-        (unsigned long)pct, (unsigned long)fota::get_next_chunk_for_cloud());
+        ",\"fota\":{\"progress\":%lu,\"acked_chunk\":%lu,\"next_chunk\":%lu}",
+        (unsigned long)pct, (unsigned long)acked_chunk, (unsigned long)next_chunk);
 
       if (body_json.back()=='}'){ body_json.pop_back(); body_json += buf; body_json += "}"; }
       g_fota_progress.has = false;
@@ -728,26 +744,13 @@ static void task_uplink(void*){
             if (hh != std::string::npos) { auto q1 = inner.find('"', hh+6); auto q2 = inner.find('"', q1+1);  mf.hash_hex   = inner.substr(q1+1, q2-q1-1); }
             if (cs != std::string::npos) { auto c  = inner.find(':', cs);   mf.chunk_size = std::strtoul(inner.c_str()+c+1, nullptr, 10); }
 
-            fota::start(mf);
+            ESP_LOGI(TAG, "FOTA manifest received: version=%s size=%u chunk_size=%u", 
+                     mf.version.c_str(), (unsigned)mf.size, (unsigned)mf.chunk_size);
+            bool started = fota::start(mf);
+            ESP_LOGI(TAG, "FOTA start result: %s, session_active=%d", started?"OK":"FAIL", fota::is_session_active());
           }
 
-          auto cpos = inner.find("\"chunk_number\"", fpos);
-          if (cpos != std::string::npos) {
-            auto colon = inner.find(':', cpos);
-            uint32_t num = std::strtoul(inner.c_str()+colon+1, nullptr, 10);
-
-            auto d = inner.find("\"data\"", cpos);
-            if (d != std::string::npos) {
-              d = inner.find('"', d + 6);
-              auto e = inner.find('"', d + 1);
-              if (d != std::string::npos && e != std::string::npos && e > d) {
-                std::string data = inner.substr(d + 1, e - d - 1);
-                if (!data.empty()) {
-                  fota::ingest_chunk(num, data);
-                }
-              }
-            }
-          }
+          // Chunks are downloaded independently by task_fota_download, not via polling
         }
       }
     }
@@ -765,13 +768,18 @@ static void task_uplink(void*){
       fota::FotaStatus status = fota::get_current_status();
       if (status == fota::FotaStatus::VERIFY_FAILED) {
         std::string failed_ver = fota::get_failed_version();
-        if (!failed_ver.empty()) {
-          g_fota_failure.has = true;
-          g_fota_failure.reason = "corruption_detected";
-          g_fota_failure.version = failed_ver;
-          log_event(("fota_corruption:" + failed_ver).c_str());
-          ESP_LOGE(TAG, "FOTA FAILURE: Image corruption detected for version %s. Rollback to previous version.",
-                   failed_ver.c_str());
+        if (!failed_ver.empty() && !g_fota_failure.has) {  // Only report once
+          // Prevent reporting the same failure version multiple times
+          static std::string last_reported_failed_version = "";
+          if (failed_ver != last_reported_failed_version) {
+            g_fota_failure.has = true;
+            g_fota_failure.reason = "corruption_detected";
+            g_fota_failure.version = failed_ver;
+            log_event(("fota_corruption:" + failed_ver).c_str());
+            ESP_LOGE(TAG, "FOTA FAILURE: Image corruption detected for version %s. Rollback to previous version.",
+                     failed_ver.c_str());
+            last_reported_failed_version = failed_ver;
+          }
         }
       }
     }
@@ -788,6 +796,91 @@ static void task_uplink(void*){
 
     vTaskDelayUntil(&last, period);
   }
+}
+
+// Helper to log FOTA event to server (will be sent in next uplink)
+// This queues an event that the uplink task will include
+static void log_fota_event_local(const std::string& event_str) {
+  log_event(event_str.c_str());
+}
+
+// ----------- FOTA Independent Download Task -----------
+// This task runs independently to download FOTA chunks sequentially
+// when a manifest is available. It runs in parallel to normal polling.
+static void task_fota_download(void* arg) {
+  static const char* TAG = "fota_dl";
+  (void)arg;
+  
+  const char* base_url = CONFIG_ECOWATT_CLOUD_BASE_URL;
+  const char* device_id = CONFIG_ECOWATT_DEVICE_ID;
+  
+  // Wait for initial network
+  vTaskDelay(pdMS_TO_TICKS(5000));
+  
+  ESP_LOGI(TAG, "FOTA download task started, base_url=%s device_id=%s", base_url, device_id);
+  
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(1000));  // Poll every second
+    
+    bool sess_active = fota::is_session_active();
+    
+    // If FOTA session is active, download chunks sequentially
+    if (sess_active) {
+      uint32_t next_expected = fota::get_next_chunk_for_cloud();
+      ESP_LOGI(TAG, "FOTA: Downloading chunk %u (session active)", (unsigned)next_expected);
+      // Session is active, download the current chunk
+      std::string chunk_resp = transport::get_fota_chunk(base_url, device_id, next_expected);
+      
+      if (!chunk_resp.empty()) {
+        // Parse JSON response: { "chunk_number": N, "data": "base64_data" }
+        // Extract the "data" field
+        auto data_pos = chunk_resp.find("\"data\":\"");
+        if (data_pos != std::string::npos) {
+          data_pos += 8;  // skip "\"data\":\""
+          auto data_end = chunk_resp.find('"', data_pos);
+          if (data_end != std::string::npos) {
+            std::string b64_data = chunk_resp.substr(data_pos, data_end - data_pos);
+            
+            // Ingest the chunk
+            if (fota::ingest_chunk(next_expected, b64_data)) {
+              ESP_LOGI(TAG, "✓ Chunk %u RECEIVED (%zu bytes b64)", (unsigned)next_expected, b64_data.size());
+              log_fota_event_local("chunk_received:" + std::to_string(next_expected));
+              // Progress callback is called inside ingest_chunk
+              // Next iteration will fetch next_expected + 1
+            } else {
+              ESP_LOGW(TAG, "✗ Failed to ingest chunk %u, will retry", (unsigned)next_expected);
+              // Retry next iteration
+              vTaskDelay(pdMS_TO_TICKS(500));
+            }
+          } else {
+            ESP_LOGW(TAG, "Malformed chunk response (no closing quote)");
+          }
+        } else {
+          ESP_LOGW(TAG, "Chunk response missing 'data' field");
+        }
+      } else {
+        // Request failed or no chunk available yet
+        uint32_t next_expected = fota::get_next_chunk_for_cloud();
+        if (next_expected == 0) {
+          ESP_LOGI(TAG, "FOTA: Waiting for chunk 0...");
+        } else {
+          ESP_LOGW(TAG, "Failed to fetch chunk %u, will retry", (unsigned)next_expected);
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+      }
+      
+      // Check if finalization is needed (all chunks downloaded)
+      bool ok_verify=false, ok_apply=false;
+      if (fota::finalize_and_apply(ok_verify, ok_apply)) {
+        ESP_LOGI(TAG, "FOTA finalize: verify=%d apply=%d", ok_verify?1:0, ok_apply?1:0);
+        // Device will reboot if apply_ok, so this task will be terminated
+      }
+    } else {
+      // Session not active - do nothing, wait for manifest from server
+      vTaskDelay(pdMS_TO_TICKS(2000));
+    }
+  }
+  vTaskDelete(nullptr);
 }
 
 // ------------------ app_main ------------------
@@ -840,6 +933,7 @@ extern "C" void app_main(void) {
   transport::set_retry_policy(3, 200 /*ms base*/, 2000 /*ms max*/);
   uplink::set_retry_policy(3, 1000 /*ms base*/, 4000 /*ms max*/);
 
-  xTaskCreatePinnedToCore(task_acq,   "acq",   4096, nullptr, 5, nullptr, 0);
-  xTaskCreatePinnedToCore(task_uplink,"uplink",8192, nullptr, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(task_acq,           "acq",           4096, nullptr, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(task_uplink,        "uplink",        8192, nullptr, 5, nullptr, 0);
+  xTaskCreatePinnedToCore(task_fota_download, "fota_download", 4096, nullptr, 4, nullptr, 1);
 }

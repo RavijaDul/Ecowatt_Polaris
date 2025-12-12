@@ -96,6 +96,59 @@ std::string post_frame(const std::string& kind,
   return frame;
 }
 
+std::string get_fota_chunk(const std::string& base_url,
+                           const std::string& device_id,
+                           uint32_t chunk_number)
+{
+  // Build URL: GET /api/fota/chunk?device=<id>&chunk=<number>
+  char url_buf[256];
+  snprintf(url_buf, sizeof(url_buf), "%s/api/fota/chunk?device=%s&chunk=%u",
+           base_url.c_str(), device_id.c_str(), (unsigned)chunk_number);
+  
+  RespBuf rb;
+  esp_http_client_config_t cfg{};
+  cfg.url = url_buf;
+  cfg.method = HTTP_METHOD_GET;
+  cfg.event_handler = http_evt;
+  cfg.user_data = &rb;
+  cfg.timeout_ms = 10000;  // longer timeout for chunk download
+  cfg.transport_type = is_https(base_url) ? HTTP_TRANSPORT_OVER_SSL : HTTP_TRANSPORT_OVER_TCP;
+#if USE_CRT_BUNDLE
+  if (is_https(base_url)) cfg.crt_bundle_attach = esp_crt_bundle_attach;
+#endif
+  
+  auto cli = esp_http_client_init(&cfg);
+  if (!cli) {
+    ESP_LOGE(TAG, "fota_chunk: http init failed");
+    return {};
+  }
+  
+  std::string last_body;
+  int last_code = -1;
+  esp_err_t last_err = ESP_FAIL;
+  for (uint8_t attempt = 0; attempt < retry_count; ++attempt) {
+    rb.data.clear();
+    last_err = esp_http_client_perform(cli);
+    last_code = (last_err == ESP_OK) ? esp_http_client_get_status_code(cli) : -1;
+    last_body = rb.data;
+    if (last_err == ESP_OK && last_code == 200 && !rb.data.empty()) {
+      ESP_LOGI(TAG, "FOTA chunk %u fetched (%d bytes)", (unsigned)chunk_number, (int)rb.data.size());
+      esp_http_client_cleanup(cli);
+      return rb.data;
+    }
+    ++conn_failures;
+    ESP_LOGW(TAG, "FOTA chunk %u attempt=%u err=%s code=%d", 
+             (unsigned)chunk_number, (unsigned)attempt+1, esp_err_to_name(last_err), last_code);
+    if (attempt < retry_count - 1) {
+      vTaskDelay(pdMS_TO_TICKS(backoff_base_ms));
+    }
+  }
+  
+  ESP_LOGE(TAG, "FOTA chunk %u failed after %u attempts", (unsigned)chunk_number, (unsigned)retry_count);
+  esp_http_client_cleanup(cli);
+  return {};
+}
+
 uint32_t get_conn_failures(){ return conn_failures; }
 
 void set_retry_policy(uint8_t retries, uint32_t base_backoff_ms, uint32_t max_backoff_ms){
