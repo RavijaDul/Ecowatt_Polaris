@@ -11,7 +11,7 @@ enum FieldId {
 
 struct RuntimeConfig {
   uint32_t sampling_interval_ms = 5000;
-  std::vector<FieldId> fields = { VAC1,IAC1,FAC1,VPV1,VPV2,IPV1,IPV2,TEMP,EXPORT_PERCENT,PAC };
+  std::vector<FieldId> fields = { VAC1,IAC1,FAC1,VPV1,VPV2,IPV1,IPV2,TEMP,PAC };
 };
 
 struct PendingCommand {

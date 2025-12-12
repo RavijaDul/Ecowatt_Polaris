@@ -16,6 +16,7 @@ DB_PATH       = os.getenv("SQLITE_PATH", "ecowatt.db")
 LOG_DIR       = os.getenv("LOG_DIR", "logs")
 PSK           = os.getenv("PSK", "ecowatt-demo-psk")
 USE_B64       = bool(int(os.getenv("USE_B64", "1")))  # 1=use base64 envelope
+FOTA_MAX_RETRIES = int(os.getenv("FOTA_MAX_RETRIES", "5"))
 
 # Track what we last served, so we can estimate "written"
 # device_id -> {"version":str, "size":int, "chunk_size":int, "next":int, "written":int, "last_served_manifest": version, "cycles_without_progress": 0}
@@ -219,6 +220,43 @@ def upsert_fota_version(device, version, size, hash_hex, status):
         status=excluded.status, updated_at=CURRENT_TIMESTAMP
     """, (device, version, size, hash_hex, status))
     db.commit()
+
+def cleanup_fota_files(version=None, reason="cleanup"):
+    """Remove manifest and all chunk files from logs folder
+    
+    Args:
+        version: If provided, only delete if manifest matches this version (safety check)
+        reason: Log message for why cleanup occurred
+    """
+    try:
+        man_path = os.path.join(LOG_DIR, "fota_manifest.json")
+        
+        # If version check requested, verify manifest matches
+        if version is not None and os.path.exists(man_path):
+            try:
+                mf = json.loads(open(man_path, "r").read())
+                if mf.get("version") != version:
+                    print(f"[FOTA] Cleanup skipped: manifest version {mf.get('version')} != {version} ({reason})", flush=True)
+                    return False
+            except Exception as e:
+                print(f"[FOTA] Warning: couldn't verify manifest version: {e}", flush=True)
+        
+        # Remove manifest
+        if os.path.exists(man_path):
+            os.remove(man_path)
+            print(f"[FOTA] Cleaned manifest ({reason})", flush=True)
+        
+        # Remove all chunk files
+        chunk_files = glob.glob(os.path.join(LOG_DIR, "fota_chunk_*.b64"))
+        for chunk_file in chunk_files:
+            os.remove(chunk_file)
+        if chunk_files:
+            print(f"[FOTA] Cleaned {len(chunk_files)} chunk files ({reason})", flush=True)
+        
+        return True
+    except Exception as e:
+        print(f"[FOTA] Error during cleanup: {e}", flush=True)
+        return False
 
 # ---- SIM Fault Injection ----
 SIM_API_BASE = "http://20.15.114.131:8080"
@@ -474,11 +512,46 @@ def _try_unwrap_envelope(raw: dict) -> Optional[dict]:
     return raw
 
 def _wrap_envelope(obj: dict) -> dict:
+    """
+    Wrap object in HMAC-signed envelope.
+    Supports test modes for security validation testing.
+    """
+    # Extract test mode flags if present
+    test_tamper_mac = obj.pop("_test_tamper_mac", None)
+    test_wrong_psk = obj.pop("_test_wrong_psk", None)
+    test_replay_nonce = obj.pop("_test_replay_nonce", None)
+    test_invalid_b64 = obj.pop("_test_invalid_b64", None)
+    test_missing_mac = obj.pop("_test_missing_mac", None)
+    
     s = json.dumps(obj, separators=(",", ":"))
-    payload = base64.b64encode(s.encode()).decode() if USE_B64 else s
-    nonce = int(time.time()*1000)
-    mac   = _hmac_hex(PSK, f"{nonce}.{payload}")
-    return {"nonce": nonce, "payload": payload, "mac": mac}
+    
+    # Handle invalid base64 test
+    if test_invalid_b64:
+        payload = "not!!!valid!!!base64!!!"
+    else:
+        payload = base64.b64encode(s.encode()).decode() if USE_B64 else s
+    
+    # Use old nonce for replay test
+    if test_replay_nonce:
+        nonce = 12345  # Very old nonce
+    else:
+        nonce = int(time.time()*1000)
+    
+    # Sign with wrong PSK for wrong_psk test
+    key_for_mac = "wrong-psk-test-key" if test_wrong_psk else PSK
+    mac = _hmac_hex(key_for_mac, f"{nonce}.{payload}")
+    
+    # Corrupt MAC for bad_hmac test
+    if test_tamper_mac:
+        mac = "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"
+    
+    envelope = {"nonce": nonce, "payload": payload, "mac": mac}
+    
+    # Remove MAC field for missing_mac test
+    if test_missing_mac:
+        del envelope["mac"]
+    
+    return envelope
 
 # ---------------- API ----------------
 
@@ -574,33 +647,22 @@ def device_upload():
                     mf_ver = mf.get("version") if isinstance(mf, dict) else None
                     mf_size = int(mf.get("size") or 0) if isinstance(mf, dict) else 0
 
-                    # Check recorded progress to ensure we finished
-                    db = get_db()
-                    row = db.execute("SELECT written, size, percent FROM fota_progress WHERE device=?", (dev,)).fetchone()
-                    written = int(row[0]) if row and row[0] is not None else 0
-                    total   = int(row[1]) if row and row[1] is not None else mf_size
-
-                    if mf_ver and served_ver and mf_ver == served_ver and (total == 0 or written >= total):
+                    # Boot OK means the device successfully downloaded, verified, and booted the new image
+                    # Mark progress as 100% complete immediately
+                    if mf_ver and served_ver and mf_ver == served_ver:
+                        # Update progress to 100% since boot_ok confirms completion
+                        upsert_progress(dev, mf_ver, mf_size, mf_size, status="boot_ok")
                         # safe to delete manifest + chunks for this manifest
-                        try:
-                            os.remove(man_path)
-                        except Exception:
-                            pass
-                        for p in glob.glob(os.path.join(LOG_DIR, "fota_chunk_*.b64")):
-                            try:
-                                os.remove(p)
-                            except Exception:
-                                pass
+                        cleanup_fota_files(version=mf_ver, reason="boot_ok")
                         # remove LAST_FOTA for this device
                         if dev in LAST_FOTA:
                             del LAST_FOTA[dev]
-                        # mark progress as complete (100%) and keep a final event
-                        upsert_progress(dev, mf_ver, total, total, status="boot_ok")
-                        upsert_fota_version(dev, mf_ver, total, "", "boot_ok")
+                        # mark in version history
+                        upsert_fota_version(dev, mf_ver, mf_size, "", "boot_ok")
                         log_fota(dev, "boot_cleanup", f"cleaned {mf_ver}")
                         print(f"[FOTA] Cleanup done after boot_ok for {dev} manifest={mf_ver}", flush=True)
                     else:
-                        print(f"[FOTA] Boot OK for {dev} but manifest mismatch or incomplete progress (mf_ver={mf_ver} served_ver={served_ver} written={written} total={total}); skipping cleanup", flush=True)
+                        print(f"[FOTA] Boot OK for {dev} but manifest mismatch (mf_ver={mf_ver} served_ver={served_ver}); skipping cleanup", flush=True)
                 else:
                     # no manifest present or no record of serving this device
                     if os.path.exists(man_path):
@@ -722,14 +784,82 @@ def device_upload():
     pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
     reply = {}
 
+    # --------- FOTA Success/Failure Detection & Cleanup ---------
+    # Check if device reports new version (success) or failure
+    device_fw_version = body.get("fw_version", "")
+    fota_failure = body.get("fota", {}).get("failure") if isinstance(body.get("fota"), dict) else None
+    
+    man_path = os.path.join(LOG_DIR, "fota_manifest.json")
+    if os.path.exists(man_path):
+        try:
+            mf = json.loads(open(man_path, "r").read())
+            manifest_version = mf.get('version', '')
+            
+            # Success case: device booted new version
+            if device_fw_version and device_fw_version == manifest_version and manifest_version:
+                print(f"[FOTA] SUCCESS: {dev} booted version {manifest_version}", flush=True)
+                log_fota(dev, "success", f"version={manifest_version}")
+                cleanup_fota_files(version=manifest_version, reason="success")
+            
+            # Failure case: device reports corruption/rollback
+            elif fota_failure:
+                failure_reason = fota_failure.get("reason", "unknown")
+                failed_version = fota_failure.get("version", "")
+                print(f"[FOTA] FAILURE: {dev} {failure_reason} version={failed_version}", flush=True)
+                log_fota(dev, "failure", f"reason={failure_reason} version={failed_version}")
+                cleanup_fota_files(version=failed_version, reason="failure")
+        except Exception as e:
+            print(f"[FOTA] Error during success/failure check: {e}", flush=True)
+
     # config_update (one-shot)
     cfg_path = os.path.join(LOG_DIR, "config_update.json")
+    test_mode_path = os.path.join(LOG_DIR, "test_security_mode.txt")
+    test_scenario = None  # Track test scenario for cleanup
+    
     if os.path.exists(cfg_path):
         try:
             cu = json.loads(open(cfg_path, "r").read())
-            reply["config_update"] = cu
+            
+            # Check if security test mode is enabled (for testing device security)
+            if os.path.exists(test_mode_path):
+                test_scenario = open(test_mode_path, "r").read().strip()
+                print(f"[TEST] Security test mode: {test_scenario}", flush=True)
+                
+                # Add test flags to reply so _wrap_envelope knows to apply test modifications
+                if test_scenario == "bad_hmac":
+                    reply["config_update"] = cu
+                    reply["_test_tamper_mac"] = "corrupt"
+                    print(f"[TEST] Sending config_update with BAD HMAC", flush=True)
+                elif test_scenario == "wrong_psk":
+                    reply["config_update"] = cu
+                    reply["_test_wrong_psk"] = "use_wrong_key"
+                    print(f"[TEST] Sending config_update signed with WRONG PSK", flush=True)
+                elif test_scenario == "replay":
+                    reply["config_update"] = cu
+                    reply["_test_replay_nonce"] = "use_old_nonce"
+                    print(f"[TEST] Sending config_update with OLD NONCE (replay)", flush=True)
+                elif test_scenario == "invalid_b64":
+                    reply["config_update"] = cu
+                    reply["_test_invalid_b64"] = "corrupt_encoding"
+                    print(f"[TEST] Sending config_update with INVALID BASE64", flush=True)
+                elif test_scenario == "missing_mac":
+                    reply["config_update"] = cu
+                    reply["_test_missing_mac"] = "omit_mac_field"
+                    print(f"[TEST] Sending config_update with MISSING MAC field", flush=True)
+                elif test_scenario == "valid":
+                    reply["config_update"] = cu
+                    print(f"[TEST] Sending VALID config_update (test mode)", flush=True)
+                else:
+                    # Unknown test scenario, treat as normal
+                    reply["config_update"] = cu
+                    print(f"[QUEUE] Sent config_update -> {cu}", flush=True)
+                    test_scenario = None
+            else:
+                # Normal mode (no test scenario) - send config with standard HMAC
+                reply["config_update"] = cu
+                print(f"[QUEUE] Sent config_update -> {cu}", flush=True)
+            
             os.remove(cfg_path)
-            print(f"[QUEUE] Sent config_update -> {cu}", flush=True)
         except Exception as e:
             print("[API] bad config_update:", e)
 
@@ -796,12 +926,13 @@ def device_upload():
         except Exception as e:
             print("[API] bad manifest:", e)
 
-    # --- FOTA chunk serving with next_chunk awareness ---
-    want_next = None
+    # --- FOTA chunk serving: simple request-response based on device's next_chunk ---
     fota_in = body.get("fota") if isinstance(body, dict) else None
+    device_next_chunk = None
+    
     if isinstance(fota_in, dict) and "next_chunk" in fota_in:
         try:
-            want_next = int(fota_in["next_chunk"])
+            device_next_chunk = int(fota_in["next_chunk"])
         except Exception:
             pass
 
@@ -815,9 +946,7 @@ def device_upload():
         LAST_FOTA[dev].update({
             "version": mf.get("version"),
             "size": int(mf.get("size") or 0),
-            "chunk_size": int(mf.get("chunk_size") or 0),
-            "next": int(want_next or 0),
-            "written": int((want_next or 0) * int(mf.get("chunk_size") or 0))
+            "chunk_size": int(mf.get("chunk_size") or 0)
         })
         
         # Log and track in DB (only if it's a NEW manifest delivery)
@@ -826,38 +955,81 @@ def device_upload():
                     f"v={mf.get('version')} size={mf.get('size')} cs={mf.get('chunk_size')}")
             # Track this version in the FOTA versions table
             upsert_fota_version(dev, mf.get("version"), int(mf.get("size") or 0), mf.get("hash", ""), "manifest_received")
+    
+    # === Update progress tracking based on device's next_chunk ===
+    # Chunks are served via independent GET endpoint, not in polling response
+    if device_next_chunk is not None and dev in LAST_FOTA:
+        manifest_sz = LAST_FOTA[dev].get("size", 0)
+        chunk_sz = LAST_FOTA[dev].get("chunk_size", 1)
+        written = device_next_chunk * chunk_sz
+        
+        # Just update progress tracking in DB
+        if written > 0:
+            upsert_progress(
+                dev,
+                LAST_FOTA[dev].get("version", ""),
+                manifest_sz,
+                written,
+                status="downloading"
+            )
 
-    # Determine which chunk to send
-    chunk_num = want_next
-    if chunk_num is None:
-        # fallback to smallest available chunk_####.b64
-        files = sorted(glob.glob(os.path.join(LOG_DIR, "fota_chunk_*.b64")))
-        if files:
-            chunk_num = int(os.path.splitext(os.path.basename(files[0]))[0].split("_")[-1])
-
-    if chunk_num is not None:
-        p = os.path.join(LOG_DIR, f"fota_chunk_{chunk_num:04d}.b64")
-        if os.path.exists(p):
-            data = open(p, "r").read().strip()
-            fobj = reply.setdefault("fota", {})
-            fobj["chunk_number"] = chunk_num
-            fobj["data"] = data
-            # keep file for retry/resume
-            print(f"[FOTA] Served exact chunk {chunk_num:04d} ({len(data)} b64 bytes)", flush=True)
-            if dev in LAST_FOTA:
-                LAST_FOTA[dev]["next"] = chunk_num + 1
-                LAST_FOTA[dev]["written"] = (
-                    (chunk_num + 1) * LAST_FOTA[dev].get("chunk_size", 0)
-                )
-                upsert_progress(
-                    dev,
-                    LAST_FOTA[dev]["version"],
-                    LAST_FOTA[dev]["size"],
-                    LAST_FOTA[dev]["written"],
-                    status="downloading"
-                )
+    # Clean up test security mode flag if it was used
+    test_mode_path = os.path.join(LOG_DIR, "test_security_mode.txt")
+    if test_scenario and os.path.exists(test_mode_path):
+        try:
+            os.remove(test_mode_path)
+            print(f"[TEST] Test flag cleared (one-shot test completed)", flush=True)
+        except Exception as e:
+            print(f"[TEST] Warning: Could not delete test flag: {e}", flush=True)
 
     return jsonify(_wrap_envelope(reply)), 200
+
+# ---- FOTA: Independent chunk download endpoint ----
+@app.get("/api/fota/chunk")
+def fota_chunk():
+    """
+    Serve FOTA chunks on-demand (independent of polling).
+    Query params: device=<id>, chunk=<number>
+    Returns: { "chunk_number": N, "data": "base64_data" } or error
+    """
+    dev = request.args.get("device", "")
+    chunk_num_str = request.args.get("chunk", "")
+    
+    if not dev or not chunk_num_str:
+        return jsonify({"error": "missing device or chunk"}), 400
+    
+    try:
+        chunk_num = int(chunk_num_str)
+    except ValueError:
+        return jsonify({"error": "invalid chunk number"}), 400
+    
+    # Check if chunk file exists
+    p = os.path.join(LOG_DIR, f"fota_chunk_{chunk_num:04d}.b64")
+    if not os.path.exists(p):
+        return jsonify({"error": f"chunk {chunk_num} not found"}), 404
+    
+    # Read and serve chunk
+    try:
+        data = open(p, "r").read().strip()
+        
+        # Track in LAST_FOTA for monitoring
+        if dev not in LAST_FOTA:
+            LAST_FOTA[dev] = {}
+        
+        # Update last requested chunk
+        if chunk_num > LAST_FOTA[dev].get("last_requested_chunk", -1):
+            LAST_FOTA[dev]["last_requested_chunk"] = chunk_num
+        
+        print(f"[FOTA] Chunk {chunk_num:04d} served to {dev} (independent request)", flush=True)
+        log_fota(dev, "chunk_served_independent", f"chunk={chunk_num}")
+        
+        return jsonify({
+            "chunk_number": chunk_num,
+            "data": data
+        }), 200
+    except Exception as e:
+        print(f"[FOTA] Error serving chunk {chunk_num}: {e}", flush=True)
+        return jsonify({"error": f"failed to read chunk: {e}"}), 500
 
 # ---- Admin: list + detail (with SCALED column) ----
 @app.get("/admin")
@@ -978,6 +1150,36 @@ def api_decoded(rowid: int):
         "received_at_ms": recv
     })
 
+@app.get("/api/fota/progress")
+def api_fota_progress():
+    """JSON endpoint for live FOTA progress updates"""
+    db = get_db()
+    prog = db.execute("""
+      SELECT device, version, size, written, percent, status, updated
+      FROM fota_progress
+      ORDER BY updated DESC
+    """).fetchall()
+    
+    result = []
+    for device, version, size, written, percent, status, updated in prog:
+        chunk_size = LAST_FOTA.get(device, {}).get("chunk_size", 8192)
+        total_chunks = (size + chunk_size - 1) // chunk_size if size and chunk_size else 0
+        current_chunk = written // chunk_size if chunk_size else 0
+        
+        result.append({
+            "device": device,
+            "version": version,
+            "size": size,
+            "written": written,
+            "percent": percent,
+            "status": status,
+            "updated": updated,
+            "current_chunk": current_chunk,
+            "total_chunks": total_chunks
+        })
+    
+    return jsonify({"ok": True, "progress": result})
+
 @app.get("/admin/fota")
 def admin_fota():
     db = get_db()
@@ -993,9 +1195,10 @@ def admin_fota():
       LIMIT 200
     """).fetchall()
 
-    out = [HTML_HEAD, "<h2>FOTA – Upload New Firmware</h2>"]
+    out = [HTML_HEAD, "<h2>🔄 FOTA – Live Progress</h2>"]
     out.append("""
     <div style="background:#f5f5f5; padding:20px; border-radius:5px; margin-bottom:30px;">
+      <h3>📤 Upload New Firmware</h3>
       <form id="fota-upload-form" enctype="multipart/form-data">
         <div style="margin-bottom:15px;">
           <label for="fota-file"><strong>Binary File (.bin):</strong></label><br/>
@@ -1012,6 +1215,9 @@ def admin_fota():
         <button type="button" onclick="uploadFotaBinary()" style="padding:10px 20px; background:#0066cc; color:white; border:none; border-radius:3px; cursor:pointer; font-size:14px;">
           Upload & Generate Chunks
         </button>
+        <button type="button" onclick="generateBadManifest()" style="padding:10px 20px; margin-left:10px; background:#ff6b6b; color:white; border:none; border-radius:3px; cursor:pointer; font-size:14px;">
+          Generate BAD Manifest (Test)
+        </button>
         <span id="upload-status" style="margin-left:20px; font-weight:bold;"></span>
       </form>
       <div id="upload-result" style="margin-top:20px; padding:10px; background:white; border:1px solid #ddd; border-radius:3px; display:none;">
@@ -1019,8 +1225,63 @@ def admin_fota():
         <pre id="result-text" style="margin-top:10px; white-space:pre-wrap; word-wrap:break-word;"></pre>
       </div>
     </div>
+    
+    <h3>📊 Live Progress Monitor <span style="font-size:12px; color:#666; font-weight:normal;">(Auto-refresh every 2s)</span></h3>
+    <div id="live-progress" style="margin-bottom:30px;">
+      <p style="color:#999;">Loading...</p>
+    </div>
 
     <script>
+    // Live progress update
+    let progressInterval = null;
+    
+    async function updateLiveProgress() {
+      try {
+        const response = await fetch('/api/fota/progress');
+        const data = await response.json();
+        
+        if (data.ok && data.progress.length > 0) {
+          let html = '<table class="table" style="margin-top:10px;"><tr><th>Device</th><th>Version</th><th>Progress</th><th>Status</th><th>Details</th></tr>';
+          
+          data.progress.forEach(p => {
+            const percent = p.percent || 0;
+            const statusColor = 
+              p.status === 'boot_ok' ? 'green' :
+              p.status === 'verify_failed' || p.status === 'boot_rollback' ? 'red' :
+              p.status === 'downloading' ? 'orange' : '#666';
+            
+            const progressBar = `
+              <div style="width:200px; background:#f0f0f0; height:20px; border-radius:4px; overflow:hidden; display:inline-block;">
+                <div style="background:#0066cc; height:100%; width:${percent}%; transition:width 0.3s;"></div>
+              </div>
+              <span style="margin-left:10px; font-weight:bold;">${percent}%</span>
+            `;
+            
+            const details = `${(p.written / 1024).toFixed(1)} KB / ${(p.size / 1024).toFixed(1)} KB<br/>Chunk ${p.current_chunk}/${p.total_chunks}`;
+            
+            html += `<tr>
+              <td><a href="/admin/fota/${p.device}">${p.device}</a></td>
+              <td>${p.version || 'N/A'}</td>
+              <td>${progressBar}</td>
+              <td style="color:${statusColor}; font-weight:bold;">${p.status || 'pending'}</td>
+              <td style="font-size:12px;">${details}</td>
+            </tr>`;
+          });
+          
+          html += '</table>';
+          document.getElementById('live-progress').innerHTML = html;
+        } else {
+          document.getElementById('live-progress').innerHTML = '<p style="color:#999;">No active FOTA sessions</p>';
+        }
+      } catch (e) {
+        console.error('Failed to fetch progress:', e);
+      }
+    }
+    
+    // Start live updates
+    updateLiveProgress();
+    progressInterval = setInterval(updateLiveProgress, 2000);
+    
     async function uploadFotaBinary() {
       const fileInput = document.getElementById('fota-file');
       const versionInput = document.getElementById('fota-version');
@@ -1087,33 +1348,110 @@ def admin_fota():
         resultText.textContent = err.message;
       }
     }
+    
+    async function generateBadManifest() {
+      const fileInput = document.getElementById('fota-file');
+      const versionInput = document.getElementById('fota-version');
+      const chunkInput = document.getElementById('fota-chunk');
+      const statusSpan = document.getElementById('upload-status');
+      const resultDiv = document.getElementById('upload-result');
+      const resultText = document.getElementById('result-text');
+      
+      // Validate inputs - same as uploadFotaBinary
+      if (!fileInput.files.length) {
+        statusSpan.textContent = '❌ Please select a file';
+        statusSpan.style.color = 'red';
+        return;
+      }
+      
+      if (!versionInput.value.trim()) {
+        statusSpan.textContent = '❌ Please enter a version';
+        statusSpan.style.color = 'red';
+        return;
+      }
+      
+      statusSpan.textContent = '⚠️ Generating BAD chunks & corrupted manifest...';
+      statusSpan.style.color = '#ff9800';
+      resultDiv.style.display = 'none';
+      
+      const formData = new FormData();
+      formData.append('file', fileInput.files[0]);
+      formData.append('version', versionInput.value);
+      formData.append('chunk_size', chunkInput.value);
+      formData.append('bad', 'true');  // Flag to indicate bad manifest
+      
+      try {
+        const response = await fetch('/api/fota/upload', {
+          method: 'POST',
+          body: formData
+        });
+        const data = await response.json();
+        
+        if (data.ok) {
+          statusSpan.textContent = '⚠️ BAD manifest created (hash corrupted)!';
+          statusSpan.style.color = '#ff6b6b';
+          resultDiv.style.display = 'block';
+          resultDiv.style.background = '#fff3e0';
+          resultText.textContent = 
+            '⚠️ CORRUPTION TEST MODE\\n' +
+            '\\n' +
+            'Version: ' + data.version + '\\n' +
+            'Size: ' + data.size + ' bytes\\n' +
+            'Chunks: ' + data.num_chunks + '\\n' +
+            '\\n' +
+            'Original hash: ' + data.original_hash + '\\n' +
+            'Bad hash:      ' + data.hash + '\\n' +
+            '\\n' +
+            'Expected behavior:\\n' +
+            '  1. Device downloads all chunks (valid)\\n' +
+            '  2. SHA256 verification FAILS (hash mismatch)\\n' +
+            '  3. Device reports: failure - corruption_detected\\n' +
+            '  4. No reboot occurs (keeps current firmware)\\n' +
+            '\\n' +
+            'Ready for testing! Device will detect corruption on next poll.';
+        } else {
+          statusSpan.textContent = '❌ Error: ' + (data.error || 'Unknown error');
+          statusSpan.style.color = 'red';
+          resultDiv.style.display = 'block';
+          resultDiv.style.background = '#ffebee';
+          resultText.textContent = JSON.stringify(data, null, 2);
+        }
+      } catch (err) {
+        statusSpan.textContent = '❌ Error: ' + err.message;
+        statusSpan.style.color = 'red';
+        resultDiv.style.display = 'block';
+        resultDiv.style.background = '#ffebee';
+        resultText.textContent = err.message;
+      }
+    }
     </script>
 
-    <h2>FOTA – Progress (all devices)</h2>""")
-    out.append("<table class='table'><tr><th>Device</th><th>Version</th><th>Written</th><th>Size</th><th>Percent</th><th>Status</th><th>Updated</th></tr>")
-    for d,v,sz,wr,pct,status,upd in prog:
-        status_display = status or "pending"
-        # Color-code status
-        if status_display == "boot_ok":
-            status_color = "style='color:green;font-weight:bold'"
-        elif status_display in ("verify_failed", "boot_rollback"):
-            status_color = "style='color:red;font-weight:bold'"
-        elif status_display == "downloading":
-            status_color = "style='color:orange'"
-        else:
-            status_color = ""
-        out.append(
-            f"<tr>"
-            f"<td><a href='/admin/fota/{d}'>{d}</a></td>"
-            f"<td>{v}</td>"
-            f"<td>{wr}</td>"
-            f"<td>{sz}</td>"
-            f"<td>{pct}%</td>"
-            f"<td {status_color}>{status_display}</td>"
-            f"<td>{upd}</td>"
-            f"</tr>"
-        )
-    out.append("</table>")
+     """)
+    #<h2>FOTA – Progress (all devices)</h2>
+    # out.append("<table class='table'><tr><th>Device</th><th>Version</th><th>Written</th><th>Size</th><th>Percent</th><th>Status</th><th>Updated</th></tr>")
+    # for d,v,sz,wr,pct,status,upd in prog:
+    #     status_display = status or "pending"
+    #     # Color-code status
+    #     if status_display == "boot_ok":
+    #         status_color = "style='color:green;font-weight:bold'"
+    #     elif status_display in ("verify_failed", "boot_rollback"):
+    #         status_color = "style='color:red;font-weight:bold'"
+    #     elif status_display == "downloading":
+    #         status_color = "style='color:orange'"
+    #     else:
+    #         status_color = ""
+    #     out.append(
+    #         f"<tr>"
+    #         f"<td><a href='/admin/fota/{d}'>{d}</a></td>"
+    #         f"<td>{v}</td>"
+    #         f"<td>{wr}</td>"
+    #         f"<td>{sz}</td>"
+    #         f"<td>{pct}%</td>"
+    #         f"<td {status_color}>{status_display}</td>"
+    #         f"<td>{upd}</td>"
+    #         f"</tr>"
+    #     )
+    # out.append("</table>")
 
     out.append("<h2>Recent FOTA Events</h2>")
     out.append("<table class='table'><tr><th>Time</th><th>Device</th><th>Kind</th><th>Detail</th></tr>")
@@ -1187,6 +1525,10 @@ def admin_fota_device(device: str):
             event_color = "style='color:red;font-weight:bold'"
         elif kind in ("verify_ok", "boot_ok"):
             event_color = "style='color:green;font-weight:bold'"
+        elif kind == "chunk_received":
+            event_color = "style='color:blue'"
+        elif kind in ("progress", "chunk_served_independent"):
+            event_color = "style='color:#666'"
         else:
             event_color = ""
         out.append(f"<tr><td>{ts}</td><td {event_color}>{kind}</td><td class='mono'>{detail}</td></tr>")
@@ -1231,24 +1573,25 @@ def admin_fota_upload():
     <div style="background:white; padding:20px; border-radius:5px; border:1px solid #ddd; margin-bottom:20px;">
       <form id="fota-upload-form" enctype="multipart/form-data">
         <div class="form-group">
-          <label for="fota-file"><strong>📁 Binary File (.bin):</strong></label>
+          <label for="fota-file"><strong>Binary File (.bin):</strong></label>
           <input type="file" id="fota-file" name="file" accept=".bin" required>
           <small style="color:#666;">Select your compiled ESP32 firmware binary</small>
         </div>
         
         <div class="form-group">
-          <label for="fota-version"><strong>📌 Firmware Version:</strong></label>
+          <label for="fota-version"><strong>Firmware Version:</strong></label>
           <input type="text" id="fota-version" name="version" placeholder="e.g., 1.0.8" required>
           <small style="color:#666;">Bump version to force a fresh OTA session (e.g., 1.0.7 → 1.0.8)</small>
         </div>
         
         <div class="form-group">
-          <label for="fota-chunk"><strong>⚙️ Chunk Size (bytes):</strong></label>
+          <label for="fota-chunk"><strong>Chunk Size (bytes):</strong></label>
           <input type="number" id="fota-chunk" name="chunk_size" value="8192" min="512" max="65536">
           <small style="color:#666;">Larger chunks = fewer uploads, but less resilient to interruptions</small>
         </div>
         
-        <button type="button" onclick="uploadFotaBinary()">🚀 Upload & Generate Chunks</button>
+        <button type="button" onclick="uploadFotaBinary()">Upload & Generate Chunks</button>
+        <button type="button" onclick="generateBadManifest()" style="margin-left:10px; background:#ff6b6b; border-color:#ff6b6b;">Generate BAD Manifest (Test Failure)</button>
         <span id="upload-status" style="margin-left:20px; font-weight:bold;"></span>
       </form>
       
@@ -1382,13 +1725,25 @@ def api_fota_upload():
         
         size = len(binary_data)
         
-        # Calculate SHA256 hash
-        hash_hex = hashlib.sha256(binary_data).hexdigest().lower()
+        # Calculate SHA256 hash (real hash)
+        real_hash_hex = hashlib.sha256(binary_data).hexdigest().lower()
+        
+        # Check if this should be a bad manifest (for testing)
+        is_bad = request.form.get("bad", "false").lower() == "true"
+        if is_bad:
+            # Corrupt the hash: flip first character
+            first_char = real_hash_hex[0]
+            corrupted_first = 'f' if first_char == '0' else '0'
+            hash_hex = corrupted_first + real_hash_hex[1:]
+            original_hash = real_hash_hex
+        else:
+            hash_hex = real_hash_hex
+            original_hash = None
         
         # Create logs directory if needed
         os.makedirs(LOG_DIR, exist_ok=True)
         
-        # Write manifest
+        # Write manifest (with possibly corrupted hash)
         manifest = {
             "version": version,
             "size": size,
@@ -1399,7 +1754,7 @@ def api_fota_upload():
         with open(man_path, "w") as f:
             json.dump(manifest, f)
         
-        # Generate and write chunks
+        # Generate and write chunks (always from real binary)
         num_chunks = 0
         for offset in range(0, size, chunk_size):
             length = min(chunk_size, size - offset)
@@ -1413,9 +1768,12 @@ def api_fota_upload():
             num_chunks += 1
         
         # Log in database
-        log_fota("server", "upload_binary", f"version={version} size={size} chunks={num_chunks} hash={hash_hex[:16]}...")
+        if is_bad:
+            log_fota("server", "upload_binary_bad", f"version={version} size={size} chunks={num_chunks} original_hash={original_hash[:16]}... bad_hash={hash_hex[:16]}...")
+        else:
+            log_fota("server", "upload_binary", f"version={version} size={size} chunks={num_chunks} hash={hash_hex[:16]}...")
         
-        return jsonify({
+        result = {
             "ok": True,
             "version": version,
             "size": size,
@@ -1423,7 +1781,12 @@ def api_fota_upload():
             "num_chunks": num_chunks,
             "chunk_size": chunk_size,
             "manifest_path": man_path
-        })
+        }
+        
+        if is_bad:
+            result["original_hash"] = original_hash
+        
+        return jsonify(result)
     
     except Exception as e:
         return jsonify({"ok": False, "error": "exception", "detail": str(e)}), 500
@@ -2115,10 +2478,10 @@ def admin_controls():
             open(os.path.join(LOG_DIR, "config_update.json"), "w").write(json.dumps(obj))
             msg = "queued config_update"
         elif kind == "command":
-            val = int(request.form.get("export_percent") or 0)
+            val = int(request.form.get("export_percent") or 10)  # Default to 10% instead of 0%
             obj = {"command":{"action":"write_register","target_register":"status_flag","value":val}}
             open(os.path.join(LOG_DIR, "command.json"), "w").write(json.dumps(obj))
-            msg = "queued command"
+            msg = f"queued command (export={val}%)"
 
         return redirect(url_for("admin_controls") + f"?ok={msg}")
 
@@ -2171,3 +2534,5 @@ if __name__ == "__main__":
     pathlib.Path(LOG_DIR).mkdir(parents=True, exist_ok=True)
     print(f"[API] starting on 0.0.0.0:{port}, DB={DB_PATH}, auth={'on' if REQUIRE_AUTH else 'off'}, envelope={'b64' if USE_B64 else 'plain'}")
     serve(app, host="0.0.0.0", port=port)
+
+

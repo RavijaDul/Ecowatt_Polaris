@@ -22,6 +22,9 @@ enum class FotaStatus : uint8_t {
 };
 
 uint32_t get_next_chunk_for_cloud();
+uint32_t get_last_acked_chunk();
+bool is_session_active();
+Manifest get_current_manifest();
 void init();
 bool start(const Manifest& m);
 bool ingest_chunk(uint32_t number, const std::string& b64);

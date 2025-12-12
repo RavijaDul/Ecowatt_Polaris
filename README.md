@@ -51,12 +51,14 @@ The server (`server/app.py`) handles data uploads from devices and serves FOTA u
    pip install -r requirements.txt
    ```
    #Run
-   ```
-   $env:SIM_KEY_B64 = "api_key"
+    ```powershell
+   $env:SIM_KEY_B64 = "NjhhZWIwNDU1ZDdmMzg3MzNiMTQ5YTFlOjY4YWViMDQ1NWQ3ZjM4NzMzYjE0OWExNA=="
    $env:AUTH_KEYS_B64 = "dXNlcjpwYXNz"
    # HMAC envelope (matches the PSK you set in menuconfig)
    $env:PSK   = "ecowatt-demo-psk"
-   $env:USE_B64 = "1"  
+   $env:USE_B64 = "1"  
+
+   python app.py 
    ```
 3. Prepare the firmware binary for FOTA by running the following commands in PowerShell (one-time setup) in server folder:
 
@@ -103,6 +105,41 @@ The server (`server/app.py`) handles data uploads from devices and serves FOTA u
 - The ESP32 device will connect to Wi-Fi, acquire data, compress it, and upload to the server.
 - FOTA updates can be triggered by placing the manifest and chunks in the server's `logs` directory.
 - Access the admin dashboard at `http://localhost:5000/admin` to view uploads and FOTA progress.
+
+
+
+## Complete Security Test Workflow
+
+```bash
+# Terminal 1: Start server
+cd d:\sem 07\Embedded\Ecowatt_Polaris
+python server/app.py
+
+# Terminal 2: Start device monitor
+idf.py monitor
+
+# Terminal 3: Run tests one by one
+
+python test/34_test_security_via_real_server.py valid
+# Wait 15 seconds, check device logs for "queued config"
+
+python test/34_test_security_via_real_server.py bad_hmac
+# Wait 15 seconds, check device logs for "bad HMAC or replay"
+
+python test/34_test_security_via_real_server.py wrong_psk
+# Wait 15 seconds, check device logs for "bad HMAC or replay"
+
+python test/34_test_security_via_real_server.py replay
+# Wait 15 seconds, check device logs for "bad HMAC or replay"
+
+python test/34_test_security_via_real_server.py invalid_b64
+# Wait 15 seconds, check device logs for "bad HMAC or replay"
+
+python test/34_test_security_via_real_server.py missing_mac
+# Wait 15 seconds, check device logs for "bad HMAC or replay"
+
+
+```
 
 ## Project Structure
 
